@@ -45,7 +45,11 @@ fn main() {
         }
     }
 
-    if let Err(e) = gui::run(state) {
+    let bg_rt = std::sync::Arc::new(
+        tokio::runtime::Runtime::new().expect("bg runtime"),
+    );
+
+    if let Err(e) = gui::run(state, bg_rt) {
         eprintln!("GUI: {e}");
     }
 }

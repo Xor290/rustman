@@ -261,6 +261,28 @@ async fn intercept_http(mut client: TcpStream, state: Shared, first_chunk: Vec<u
     }
 }
 
+// ── Public API for Repeater tab ──────────────────────────────────────────────
+
+/// Send a raw HTTP or HTTPS request and return the raw response.
+/// Called from the Repeater tab (in a background thread / tokio runtime).
+pub async fn repeater_send(host: &str, port: u16, tls: bool, request: Vec<u8>) -> Vec<u8> {
+    // rewrite normalises \n→\r\n and injects Connection: close so drain() terminates
+    let request = rewrite(request);
+    if tls {
+        forward_tls(host, port, request).await
+    } else {
+        match tokio::net::TcpStream::connect(format!("{host}:{port}")).await {
+            Ok(mut s) => {
+                if s.write_all(&request).await.is_err() {
+                    return b"--- Send failed ---\n".to_vec();
+                }
+                drain(&mut s).await
+            }
+            Err(e) => format!("--- Connection failed: {e} ---\n").into_bytes(),
+        }
+    }
+}
+
 // ── I/O helpers ───────────────────────────────────────────────────────────────
 
 async fn read_request<R: AsyncRead + Unpin>(r: &mut R, mut buf: Vec<u8>) -> Option<Vec<u8>> {
@@ -301,6 +323,9 @@ async fn drain<R: AsyncRead + Unpin>(r: &mut R) -> Vec<u8> {
 /// Returns true if this request should be intercepted.
 /// Side-effect: if the request is a top-level navigation, updates focused_host.
 fn update_focus_and_check(state: &Shared, raw: &[u8], host: &str) -> bool {
+    if is_extension_request(raw) {
+        return false;
+    }
     let nav = is_navigation(raw);
     let mut s = state.lock().unwrap();
     if nav {
@@ -310,30 +335,31 @@ fn update_focus_and_check(state: &Shared, raw: &[u8], host: &str) -> bool {
     s.is_focused(host)
 }
 
+/// True when Origin or Referer reveals a browser extension as the sender.
+fn is_extension_request(raw: &[u8]) -> bool {
+    let text = std::str::from_utf8(raw).unwrap_or("");
+    for line in text.lines() {
+        let low = line.to_ascii_lowercase();
+        if low.starts_with("origin:") || low.starts_with("referer:") {
+            if low.contains("moz-extension://") || low.contains("chrome-extension://") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// True when the request is a top-level page navigation.
-/// Detection uses Sec-Fetch-Mode (modern browsers) with a fallback
-/// to "GET with no Referer" for older/non-standard clients.
+/// Relies on Sec-Fetch-Mode only — the "GET with no Referer" fallback was
+/// removed because extensions make exactly those requests.
 fn is_navigation(raw: &[u8]) -> bool {
     let text = std::str::from_utf8(raw).unwrap_or("");
-    let mut has_sec_fetch = false;
-
     for line in text.lines() {
         let lower = line.to_ascii_lowercase();
         if lower.starts_with("sec-fetch-mode:") {
-            has_sec_fetch = true;
             return lower.contains("navigate");
         }
     }
-
-    // Fallback: GET with no Referer header (likely a fresh navigation)
-    if !has_sec_fetch {
-        let is_get = text.lines().next()
-            .map(|l| l.starts_with("GET ")).unwrap_or(false);
-        let has_referer = text.lines()
-            .any(|l| l.to_ascii_lowercase().starts_with("referer:"));
-        return is_get && !has_referer;
-    }
-
     false
 }
 
