@@ -1,5 +1,6 @@
 mod app;
 mod ca;
+mod crawler;
 mod gui;
 mod proxy;
 
@@ -8,7 +9,8 @@ use std::sync::{Arc, Mutex};
 
 fn main() {
     unsafe {
-        if std::env::var("LIBGL_ALWAYS_SOFTWARE").is_err() {
+        let v = std::env::var("LIBGL_ALWAYS_SOFTWARE").unwrap_or_default();
+        if v.is_empty() || v == "0" {
             std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
         }
     }
@@ -38,7 +40,10 @@ fn main() {
     });
 
     match ready_rx.recv().unwrap_or_else(|_| Err("proxy thread died".into())) {
-        Ok(port) => eprintln!("[rustman] proxy listening on 127.0.0.1:{port}"),
+        Ok(port) => {
+            eprintln!("[rustman] proxy listening on 127.0.0.1:{port}");
+            state.lock().unwrap().settings.proxy_port = port;
+        }
         Err(e) => {
             eprintln!("[rustman] ERROR: {e}");
             std::process::exit(1);

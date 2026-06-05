@@ -39,17 +39,50 @@ impl Request {
     }
 }
 
+// ── Settings ──────────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+pub struct Settings {
+    /// When false every request is auto-forwarded and nothing appears in the list.
+    pub intercept_enabled: bool,
+    /// Hosts/patterns (lowercase substring match) that are always forwarded silently.
+    pub ignore_hosts: Vec<String>,
+    /// Maximum number of requests kept in the list; oldest completed ones are pruned.
+    pub max_requests: usize,
+    /// Informational — set at startup from the bound port.
+    pub proxy_port: u16,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            intercept_enabled: true,
+            ignore_hosts: Vec::new(),
+            max_requests: 500,
+            proxy_port: 8080,
+        }
+    }
+}
+
+// ── AppState ──────────────────────────────────────────────────────────────────
+
 pub struct AppState {
     pub requests: Vec<Request>,
     pub next_id: usize,
     /// Host currently in focus (set when a top-level navigation is detected).
     /// None = no navigation seen yet → auto-forward everything.
     pub focused_host: Option<String>,
+    pub settings: Settings,
 }
 
 impl AppState {
     pub fn new() -> Self {
-        Self { requests: Vec::new(), next_id: 0, focused_host: None }
+        Self {
+            requests: Vec::new(),
+            next_id: 0,
+            focused_host: None,
+            settings: Settings::default(),
+        }
     }
 
     pub fn push(&mut self, mut req: Request) -> usize {
@@ -57,6 +90,15 @@ impl AppState {
         self.next_id += 1;
         req.id = id;
         self.requests.push(req);
+        // Prune oldest completed request when over the limit
+        let max = self.settings.max_requests;
+        if self.requests.len() > max {
+            if let Some(i) = self.requests.iter().position(
+                |r| !matches!(r.status, Status::Pending | Status::Forwarding)
+            ) {
+                self.requests.remove(i);
+            }
+        }
         id
     }
 
@@ -123,6 +165,12 @@ impl AppState {
             Some(f) => base_domain(host) == base_domain(f),
         }
     }
+
+    /// Return true if `host` matches any entry in the ignore list.
+    pub fn is_ignored(&self, host: &str) -> bool {
+        let low = host.to_ascii_lowercase();
+        self.settings.ignore_hosts.iter().any(|pat| low.contains(pat.as_str()))
+    }
 }
 
 pub type Shared = Arc<Mutex<AppState>>;
@@ -135,7 +183,6 @@ pub fn base_domain(host: &str) -> &str {
     match parts.len() {
         0 | 1 | 2 => host,
         _ => {
-            // Keep last two labels; host starts at the third-from-last dot.
             let dots: Vec<usize> = host.match_indices('.').map(|(i, _)| i).collect();
             &host[dots[dots.len() - 2] + 1..]
         }

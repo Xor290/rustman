@@ -328,6 +328,9 @@ fn update_focus_and_check(state: &Shared, raw: &[u8], host: &str) -> bool {
     }
     let nav = is_navigation(raw);
     let mut s = state.lock().unwrap();
+    if !s.settings.intercept_enabled || s.is_ignored(host) {
+        return false;
+    }
     if nav {
         eprintln!("[focus] navigation → {host}");
         s.focused_host = Some(host.to_string());
