@@ -1,9 +1,10 @@
 mod app;
 mod ca;
+mod claude_client;
 mod crawler;
 mod gui;
+mod mcp;
 mod proxy;
-
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -39,7 +40,10 @@ fn main() {
             .block_on(proxy::run(proxy_state, proxy_ca, 8080, ready_tx));
     });
 
-    match ready_rx.recv().unwrap_or_else(|_| Err("proxy thread died".into())) {
+    match ready_rx
+        .recv()
+        .unwrap_or_else(|_| Err("proxy thread died".into()))
+    {
         Ok(port) => {
             eprintln!("[rustman] proxy listening on 127.0.0.1:{port}");
             state.lock().unwrap().settings.proxy_port = port;
@@ -50,9 +54,12 @@ fn main() {
         }
     }
 
-    let bg_rt = std::sync::Arc::new(
-        tokio::runtime::Runtime::new().expect("bg runtime"),
-    );
+    let bg_rt = std::sync::Arc::new(tokio::runtime::Runtime::new().expect("bg runtime"));
+
+    let mcp_state = state.clone();
+    bg_rt.spawn(async move {
+        mcp::serve(mcp_state, 8099).await;
+    });
 
     if let Err(e) = gui::run(state, bg_rt) {
         eprintln!("GUI: {e}");
@@ -87,9 +94,13 @@ fn auto_install_cert(cert_path: &Path) {
     let mut any_installed = false;
 
     for profile in &profiles {
-        let db_prefix = if profile.join("cert9.db").exists() { "sql:" } else { "dbm:" };
-        let db_arg    = format!("{}{}", db_prefix, profile.display());
-        let cert_str  = cert_path.display().to_string();
+        let db_prefix = if profile.join("cert9.db").exists() {
+            "sql:"
+        } else {
+            "dbm:"
+        };
+        let db_arg = format!("{}{}", db_prefix, profile.display());
+        let cert_str = cert_path.display().to_string();
 
         // Always delete the old entry first (ignore errors — might not exist).
         let _ = std::process::Command::new("certutil")
@@ -98,8 +109,17 @@ fn auto_install_cert(cert_path: &Path) {
 
         // Install the current cert (same DER every run if key hasn't changed).
         let out = std::process::Command::new("certutil")
-            .args(["-d", &db_arg, "-A", "-t", "CT,,",
-                   "-n", "rustman Proxy CA", "-i", &cert_str])
+            .args([
+                "-d",
+                &db_arg,
+                "-A",
+                "-t",
+                "CT,,",
+                "-n",
+                "rustman Proxy CA",
+                "-i",
+                &cert_str,
+            ])
             .output();
 
         match out {
@@ -131,7 +151,8 @@ fn find_firefox_profiles() -> Vec<PathBuf> {
     // Windows Firefox accessed from WSL2 (/mnt/c/Users/<user>/AppData/...)
     if let Ok(entries) = std::fs::read_dir("/mnt/c/Users") {
         for entry in entries.flatten() {
-            let p = entry.path()
+            let p = entry
+                .path()
                 .join("AppData/Roaming/Mozilla/Firefox/Profiles");
             collect_profiles(&p, &mut out);
         }
@@ -142,7 +163,9 @@ fn find_firefox_profiles() -> Vec<PathBuf> {
 
 /// Walk `dir` and collect any subdirectory that contains cert9.db or cert8.db.
 fn collect_profiles(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in rd.flatten() {
         let p = entry.path();
         if p.is_dir() && (p.join("cert9.db").exists() || p.join("cert8.db").exists()) {

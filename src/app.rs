@@ -51,6 +51,10 @@ pub struct Settings {
     pub max_requests: usize,
     /// Informational — set at startup from the bound port.
     pub proxy_port: u16,
+    /// Anthropic API key for the in-app Claude chat.
+    pub api_key: String,
+    /// Use light theme instead of dark.
+    pub light_mode: bool,
 }
 
 impl Default for Settings {
@@ -60,6 +64,8 @@ impl Default for Settings {
             ignore_hosts: Vec::new(),
             max_requests: 500,
             proxy_port: 8080,
+            api_key: String::new(),
+            light_mode: false,
         }
     }
 }
@@ -73,6 +79,10 @@ pub struct AppState {
     /// None = no navigation seen yet → auto-forward everything.
     pub focused_host: Option<String>,
     pub settings: Settings,
+    /// Unread prompt waiting for Claude Code to pick up.
+    pub pending_prompt: Option<String>,
+    /// Full chat history displayed in the Claude tab.
+    pub chat_messages: Vec<ChatMessage>,
 }
 
 impl AppState {
@@ -82,6 +92,8 @@ impl AppState {
             next_id: 0,
             focused_host: None,
             settings: Settings::default(),
+            pending_prompt: None,
+            chat_messages: Vec::new(),
         }
     }
 
@@ -174,6 +186,14 @@ impl AppState {
 }
 
 pub type Shared = Arc<Mutex<AppState>>;
+
+// ── Chat ──────────────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+pub struct ChatMessage {
+    pub from_user: bool,
+    pub text: String,
+}
 
 /// Extract the registrable domain (e.g. "api.example.com" → "example.com").
 /// Simple heuristic — good enough for common cases.

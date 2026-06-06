@@ -29,6 +29,7 @@ enum ActiveTab {
     Repeater,
     Crawler,
     Settings,
+    Claude,
 }
 
 // ── Repeater session ─────────────────────────────────────────────────────────
@@ -61,6 +62,11 @@ struct RustmanApp {
     rt: Arc<tokio::runtime::Runtime>,
     // Settings tab
     settings_ignore_input: String,
+    // Claude tab
+    claude_input: String,
+    claude_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    claude_thinking: bool,
+    claude_mode: crate::claude_client::AssistantMode,
     // Crawler tab
     crawler_url: String,
     crawler_max_depth: usize,
@@ -84,6 +90,10 @@ impl RustmanApp {
             rep_selected: None,
             rt,
             settings_ignore_input: String::new(),
+            claude_input: String::new(),
+            claude_rx: None,
+            claude_thinking: false,
+            claude_mode: crate::claude_client::AssistantMode::General,
             crawler_url: String::new(),
             crawler_max_depth: 3,
             crawler_entries: Vec::new(),
@@ -197,6 +207,23 @@ impl RustmanApp {
         }
     }
 
+    fn poll_claude(&mut self) {
+        if let Some(rx) = &self.claude_rx {
+            if let Ok(result) = rx.try_recv() {
+                let text = match result {
+                    Ok(t) => t,
+                    Err(e) => format!("Error: {e}"),
+                };
+                self.state.lock().unwrap().chat_messages.push(crate::app::ChatMessage {
+                    from_user: false,
+                    text,
+                });
+                self.claude_thinking = false;
+                self.claude_rx = None;
+            }
+        }
+    }
+
     fn send_selected_to_repeater(&mut self) {
         let idx = match self.selected {
             Some(i) => i,
@@ -232,9 +259,14 @@ impl RustmanApp {
 impl eframe::App for RustmanApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(std::time::Duration::from_millis(40));
+        {
+            let light = self.state.lock().unwrap().settings.light_mode;
+            ctx.set_visuals(if light { light_theme() } else { dark_theme() });
+        }
         self.sync_selection();
         self.poll_repeater();
         self.poll_crawler();
+        self.poll_claude();
 
         if self.tab == ActiveTab::Proxy
             && ctx.input(|i| i.key_pressed(egui::Key::R) && i.modifiers.ctrl)
@@ -258,6 +290,9 @@ impl eframe::App for RustmanApp {
             }
             ActiveTab::Settings => {
                 self.draw_settings(ctx);
+            }
+            ActiveTab::Claude => {
+                self.draw_claude(ctx);
             }
         }
     }
@@ -328,6 +363,22 @@ impl RustmanApp {
                     );
                     if ui.add(settings_btn).clicked() {
                         self.tab = ActiveTab::Settings;
+                    }
+
+                    let has_pending = self.state.lock().unwrap().pending_prompt.is_some();
+                    let claude_label = if has_pending { "Claude ●" } else { "Claude" };
+                    let claude_btn = egui::SelectableLabel::new(
+                        self.tab == ActiveTab::Claude,
+                        RichText::new(claude_label)
+                            .size(13.0)
+                            .color(if has_pending {
+                                Color32::from_rgb(80, 200, 255)
+                            } else {
+                                Color32::GRAY
+                            }),
+                    );
+                    if ui.add(claude_btn).clicked() {
+                        self.tab = ActiveTab::Claude;
                     }
 
                     ui.separator();
@@ -418,6 +469,12 @@ impl RustmanApp {
                         let port = s.settings.proxy_port;
                         let n = s.settings.ignore_hosts.len();
                         format!("  Settings  ·  proxy 127.0.0.1:{port}  ·  {n} ignore rule(s)")
+                    }
+                    ActiveTab::Claude => {
+                        let s = self.state.lock().unwrap();
+                        let n = s.chat_messages.len();
+                        let pending = if s.pending_prompt.is_some() { "  ·  waiting for Claude…" } else { "" };
+                        format!("  Claude  ·  {n} message(s){pending}")
                     }
                 };
                 ui.label(RichText::new(text).size(11.0).color(Color32::DARK_GRAY));
@@ -1278,12 +1335,220 @@ impl RustmanApp {
         });
     }
 
+    // ── Claude tab ────────────────────────────────────────────────────────────
+    fn draw_claude(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.vertical(|ui| {
+                // ── Header ────────────────────────────────────────────────
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("Claude")
+                            .size(15.0)
+                            .strong()
+                            .color(Color32::from_rgb(80, 180, 255)),
+                    );
+                    ui.add_space(12.0);
+
+                    let is_general = self.claude_mode == crate::claude_client::AssistantMode::General;
+                    let is_pentest = self.claude_mode == crate::claude_client::AssistantMode::Pentest;
+
+                    if ui.add(egui::SelectableLabel::new(is_general,
+                        RichText::new("General").size(12.0)
+                    )).clicked() {
+                        self.claude_mode = crate::claude_client::AssistantMode::General;
+                    }
+                    if ui.add(egui::SelectableLabel::new(is_pentest,
+                        RichText::new("Pentest").size(12.0)
+                            .color(if is_pentest {
+                                Color32::from_rgb(255, 140, 60)
+                            } else {
+                                Color32::GRAY
+                            })
+                    )).clicked() {
+                        self.claude_mode = crate::claude_client::AssistantMode::Pentest;
+                    }
+
+                    ui.add_space(8.0);
+                    ui.colored_label(Color32::DARK_GRAY, if is_pentest {
+                        "Senior Web Pentester — structured pentest reports"
+                    } else {
+                        "General security assistant"
+                    });
+                });
+                ui.add_space(4.0);
+                ui.add(egui::Separator::default().spacing(2.0));
+
+                // ── Message history ───────────────────────────────────────
+                let messages: Vec<crate::app::ChatMessage> = {
+                    self.state.lock().unwrap().chat_messages.clone()
+                };
+                let waiting = self.claude_thinking;
+
+                let history_h = ui.available_height() - 72.0;
+                ScrollArea::vertical()
+                    .id_salt("claude_history")
+                    .max_height(history_h)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        ui.add_space(4.0);
+                        for msg in &messages {
+                            ui.add_space(6.0);
+                            if msg.from_user {
+                                // User bubble — right aligned
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                                    ui.add_space(8.0);
+                                    egui::Frame::none()
+                                        .fill(Color32::from_rgb(35, 60, 100))
+                                        .rounding(8.0)
+                                        .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                                        .show(ui, |ui| {
+                                            ui.set_max_width(ui.available_width() * 0.75);
+                                            ui.label(
+                                                RichText::new(&msg.text)
+                                                    .size(13.0)
+                                                    .color(Color32::from_rgb(210, 225, 255)),
+                                            );
+                                        });
+                                });
+                            } else {
+                                // Claude bubble — left aligned
+                                ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
+                                    ui.add_space(8.0);
+                                    egui::Frame::none()
+                                        .fill(Color32::from_rgb(28, 32, 42))
+                                        .rounding(8.0)
+                                        .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                                        .show(ui, |ui| {
+                                            ui.set_max_width(ui.available_width() * 0.85);
+                                            ui.label(
+                                                RichText::new(&msg.text)
+                                                    .size(13.0)
+                                                    .color(Color32::from_rgb(200, 210, 200)),
+                                            );
+                                        });
+                                });
+                            }
+                        }
+
+                        if waiting {
+                            ui.add_space(6.0);
+                            ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
+                                ui.add_space(8.0);
+                                ui.colored_label(
+                                    Color32::from_rgb(50, 200, 255),
+                                    RichText::new("↻  Waiting for Claude Code…").size(12.0).italics(),
+                                );
+                            });
+                        }
+
+                        if messages.is_empty() && !waiting {
+                            ui.add_space(40.0);
+                            ui.centered_and_justified(|ui| {
+                                ui.label(
+                                    RichText::new(
+                                        "Type a message below.\n\n\
+                                         Claude Code will read it via get_user_prompt()\n\
+                                         and reply here via reply_to_user().",
+                                    )
+                                    .size(13.0)
+                                    .color(Color32::from_rgb(60, 65, 80)),
+                                );
+                            });
+                        }
+                    });
+
+                // ── Input bar ─────────────────────────────────────────────
+                ui.add(egui::Separator::default().spacing(4.0));
+                ui.horizontal(|ui| {
+                    let te = TextEdit::singleline(&mut self.claude_input)
+                        .hint_text("Ask Claude Code… (Enter to send)")
+                        .desired_width(ui.available_width() - 70.0)
+                        .font(egui::TextStyle::Body);
+                    let resp = ui.add(te);
+
+                    let send_label = if self.claude_thinking { "  …  " } else { "  Send  " };
+                    let send = ui.add_enabled(
+                        !self.claude_thinking,
+                        egui::Button::new(RichText::new(send_label).color(Color32::BLACK))
+                            .fill(if self.claude_thinking {
+                                Color32::from_rgb(60, 70, 90)
+                            } else {
+                                Color32::from_rgb(60, 130, 200)
+                            }),
+                    );
+                    let send_clicked = !self.claude_thinking
+                        && (send.clicked()
+                            || (resp.lost_focus()
+                                && ctx.input(|i| i.key_pressed(egui::Key::Enter))));
+
+                    if send_clicked {
+                        let text = self.claude_input.trim().to_string();
+                        if !text.is_empty() {
+                            let api_key = self.state.lock().unwrap().settings.api_key.clone();
+                            if api_key.is_empty() {
+                                self.state.lock().unwrap().chat_messages.push(crate::app::ChatMessage {
+                                    from_user: false,
+                                    text: "No API key set. Add your Anthropic API key in the Settings tab.".into(),
+                                });
+                            } else {
+                                {
+                                    let mut s = self.state.lock().unwrap();
+                                    s.chat_messages.push(crate::app::ChatMessage {
+                                        from_user: true,
+                                        text: text.clone(),
+                                    });
+                                }
+                                // Build conversation history for the API
+                                let history: Vec<serde_json::Value> = self
+                                    .state
+                                    .lock()
+                                    .unwrap()
+                                    .chat_messages
+                                    .iter()
+                                    .map(|m| serde_json::json!({
+                                        "role": if m.from_user { "user" } else { "assistant" },
+                                        "content": m.text,
+                                    }))
+                                    .collect();
+
+                                let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                                let state_clone = self.state.clone();
+                                let mode = self.claude_mode;
+                                self.rt.spawn(async move {
+                                    crate::claude_client::chat(api_key, mode, state_clone, history, tx).await;
+                                });
+                                self.claude_rx = Some(rx);
+                                self.claude_thinking = true;
+                            }
+                            self.claude_input.clear();
+                        }
+                        resp.request_focus();
+                    }
+                });
+            });
+        });
+    }
+
     // ── Settings tab ─────────────────────────────────────────────────────────
     fn draw_settings(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ScrollArea::vertical().show(ui, |ui| {
                 ui.add_space(16.0);
                 ui.set_max_width(680.0);
+
+                // ── Appearance ───────────────────────────────────────────
+                section_header(ui, "APPEARANCE");
+                ui.add_space(6.0);
+                {
+                    let mut s = self.state.lock().unwrap();
+                    ui.checkbox(
+                        &mut s.settings.light_mode,
+                        RichText::new("Light mode").size(13.0),
+                    );
+                }
+                ui.add_space(20.0);
 
                 // ── Interception ──────────────────────────────────────────
                 section_header(ui, "INTERCEPTION");
@@ -1379,6 +1644,28 @@ impl RustmanApp {
                 );
                 ui.add_space(20.0);
 
+                // ── Claude API ────────────────────────────────────────────
+                section_header(ui, "CLAUDE API");
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("API Key:");
+                    ui.add_space(4.0);
+                    let mut s = self.state.lock().unwrap();
+                    ui.add(
+                        TextEdit::singleline(&mut s.settings.api_key)
+                            .hint_text("sk-ant-…")
+                            .password(true)
+                            .desired_width(320.0)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                });
+                ui.add_space(2.0);
+                ui.colored_label(
+                    Color32::DARK_GRAY,
+                    "Used by the Claude tab to call the Anthropic API directly.",
+                );
+                ui.add_space(20.0);
+
                 // ── Requests ──────────────────────────────────────────────
                 section_header(ui, "REQUESTS");
                 ui.add_space(6.0);
@@ -1471,5 +1758,17 @@ fn dark_theme() -> egui::Visuals {
     v.widgets.inactive.bg_fill = Color32::from_rgb(35, 35, 44);
     v.widgets.hovered.bg_fill = Color32::from_rgb(50, 50, 65);
     v.widgets.active.bg_fill = Color32::from_rgb(60, 60, 80);
+    v
+}
+
+fn light_theme() -> egui::Visuals {
+    let mut v = egui::Visuals::light();
+    v.panel_fill = Color32::from_rgb(245, 246, 250);
+    v.window_fill = Color32::from_rgb(255, 255, 255);
+    v.extreme_bg_color = Color32::from_rgb(230, 232, 240);
+    v.widgets.noninteractive.bg_fill = Color32::from_rgb(235, 237, 245);
+    v.widgets.inactive.bg_fill = Color32::from_rgb(225, 228, 238);
+    v.widgets.hovered.bg_fill = Color32::from_rgb(210, 215, 232);
+    v.widgets.active.bg_fill = Color32::from_rgb(195, 202, 225);
     v
 }
