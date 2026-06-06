@@ -75,6 +75,7 @@ struct RustmanApp {
     crawler_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
     crawler_running: bool,
     crawler_selected: Option<usize>,
+    crawler_attacks: Vec<crate::crawler::AttackVariant>,
 }
 
 impl RustmanApp {
@@ -101,6 +102,7 @@ impl RustmanApp {
             crawler_stop: None,
             crawler_running: false,
             crawler_selected: None,
+            crawler_attacks: Vec::new(),
         }
     }
 
@@ -196,6 +198,9 @@ impl RustmanApp {
                             response: Vec::new(),
                         });
                     }
+                }
+                Ok(CrawlMsg::Attack { variant }) => {
+                    self.crawler_attacks.extend(variant);
                 }
                 Ok(CrawlMsg::Finished) => {
                     self.crawler_running = false;
@@ -1066,6 +1071,7 @@ impl RustmanApp {
                         ).fill(Color32::from_rgb(60, 180, 80));
                         if ui.add(start_btn).clicked() && !self.crawler_url.trim().is_empty() {
                             self.crawler_entries.clear();
+                            self.crawler_attacks.clear();
                             self.crawler_selected = None;
                             self.crawler_running = true;
 
@@ -1086,6 +1092,7 @@ impl RustmanApp {
                             ui.add_space(4.0);
                             if ui.button(RichText::new("Clear").color(Color32::from_rgb(150, 150, 150))).clicked() {
                                 self.crawler_entries.clear();
+                                self.crawler_attacks.clear();
                                 self.crawler_selected = None;
                             }
                         }
