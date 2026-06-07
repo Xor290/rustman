@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.png" alt="Rustman" width="120" />
+</p>
+
 # rustman
 
 **Rustman** is an open-source MITM proxy and web security testing tool built in Rust. It intercepts and inspects HTTP/HTTPS traffic, replays requests via a built-in Repeater, and crawls websites to automatically inject OWASP Top 10 payloads across URL parameters, headers, and request bodies. It features a native GUI, a Claude AI assistant for pentest analysis, and an MCP server for Claude Code integration.
