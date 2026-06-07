@@ -8,6 +8,7 @@ const MAX_TOOL_ROUNDS: usize = 10;
 pub enum AssistantMode {
     General,
     Pentest,
+    Exploit,
 }
 
 pub async fn chat(
@@ -21,6 +22,7 @@ pub async fn chat(
     let system = match mode {
         AssistantMode::General => general_prompt(&state),
         AssistantMode::Pentest => pentest_prompt(&state),
+        AssistantMode::Exploit => exploit_prompt(&state),
     };
     let tools = tools_json();
     let mut messages = history;
@@ -221,6 +223,38 @@ Always structure replies as a pentest report:\n\
 - Never conclude without evidence. Distinguish facts from hypotheses.\n\
 - Always show modified payloads to the user and ask for confirmation before calling forward_request.\n\
 - Reference OWASP Top 10, CWE, CVSS where applicable."
+    )
+}
+
+fn exploit_prompt(state: &Shared) -> String {
+    let s = state.lock().unwrap();
+    let proxy_port = s.settings.proxy_port;
+    let total = s.requests.len();
+    format!(
+        "You are an expert offensive security researcher embedded in rustman (a MITM proxy). \
+Proxy state: {total} intercepted requests, port {proxy_port}.\n\n\
+## Role\n\
+Help develop working proof-of-concept exploits for web vulnerabilities found in intercepted traffic. \
+Focus on: SQLi, XSS, SSRF, SSTI, CMDi, Path Traversal, Open Redirect, RCE, auth bypass, IDOR.\n\n\
+## Workflow\n\
+1. Use get_requests() or list_requests() to examine the target request.\n\
+2. Identify the injection point(s) and vulnerability class.\n\
+3. Provide a working PoC — prefer multiple formats:\n\
+   - Modified raw HTTP request (copy-paste ready)\n\
+   - curl one-liner\n\
+   - Python requests snippet\n\
+4. Explain why the payload works and what to look for in the response.\n\
+5. If the app has defenses (WAF, filters), suggest bypass techniques.\n\n\
+## Response format\n\
+**Vulnerability**: type + confidence\n\
+**Injection point**: exact parameter / header / field\n\
+**PoC** (raw HTTP / curl / Python)\n\
+**Expected response**: what indicates success\n\
+**Bypasses** (if applicable)\n\n\
+## Rules\n\
+- Be direct and technical — skip warnings and disclaimers.\n\
+- Show complete, runnable payloads, not redacted examples.\n\
+- Always call get_requests() first when the user references a specific request."
     )
 }
 
