@@ -49,7 +49,8 @@ pub struct Settings {
     pub ignore_hosts: Vec<String>,
     /// Maximum number of requests kept in the list; oldest completed ones are pruned.
     pub max_requests: usize,
-    /// Informational — set at startup from the bound port.
+    /// Informational — updated when the proxy successfully binds.
+    pub proxy_addr: String,
     pub proxy_port: u16,
     /// Anthropic API key for the in-app Claude chat.
     pub api_key: String,
@@ -63,6 +64,7 @@ impl Default for Settings {
             intercept_enabled: true,
             ignore_hosts: Vec::new(),
             max_requests: 500,
+            proxy_addr: "127.0.0.1".to_string(),
             proxy_port: 8080,
             api_key: String::new(),
             light_mode: false,
@@ -86,6 +88,10 @@ pub struct AppState {
     pub pending_prompt: Option<String>,
     /// Full chat history displayed in the Claude tab.
     pub chat_messages: Vec<ChatMessage>,
+    /// Send (addr, port) here to restart the proxy listener.
+    pub proxy_restart_tx: Option<std::sync::mpsc::SyncSender<(String, u16)>>,
+    /// Set while a proxy restart is in progress.
+    pub proxy_restarting: bool,
 }
 
 impl AppState {
@@ -98,6 +104,8 @@ impl AppState {
             settings: Settings::default(),
             pending_prompt: None,
             chat_messages: Vec::new(),
+            proxy_restart_tx: None,
+            proxy_restarting: false,
         }
     }
 

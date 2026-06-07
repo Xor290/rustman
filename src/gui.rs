@@ -2,12 +2,29 @@ use crate::app::{Shared, Status};
 use eframe::egui::{self, Color32, RichText, ScrollArea, TextEdit, Vec2};
 use std::sync::Arc;
 
+fn load_window_icon() -> std::sync::Arc<egui::IconData> {
+    let bytes = include_bytes!("../logo.png");
+    let img   = image::load_from_memory(bytes)
+        .expect("logo.png embedded")
+        .resize_exact(256, 256, image::imageops::FilterType::Lanczos3)
+        .to_rgba8();
+    let (w, h) = img.dimensions();
+    std::sync::Arc::new(egui::IconData {
+        rgba:   img.into_raw(),
+        width:  w,
+        height: h,
+    })
+}
+
 pub fn run(state: Shared, rt: Arc<tokio::runtime::Runtime>) -> Result<(), eframe::Error> {
+    let icon = load_window_icon();
+
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("RUSTMAN")
             .with_inner_size([1300.0, 760.0])
-            .with_min_inner_size([900.0, 500.0]),
+            .with_min_inner_size([900.0, 500.0])
+            .with_icon(icon),
         ..Default::default()
     };
 
@@ -49,6 +66,7 @@ struct RepeaterSession {
 
 struct RustmanApp {
     state: Shared,
+    logo_texture: Option<egui::TextureHandle>,
     // Proxy tab
     selected: Option<usize>,
     edit_buf: String,
@@ -62,6 +80,8 @@ struct RustmanApp {
     rt: Arc<tokio::runtime::Runtime>,
     // Settings tab
     settings_ignore_input: String,
+    settings_proxy_addr: String,
+    settings_proxy_port: u16,
     // Claude tab
     claude_input: String,
     claude_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
@@ -98,6 +118,7 @@ impl RustmanApp {
     fn new(state: Shared, rt: Arc<tokio::runtime::Runtime>) -> Self {
         Self {
             state,
+            logo_texture: None,
             selected: None,
             edit_buf: String::new(),
             dirty: false,
@@ -107,6 +128,8 @@ impl RustmanApp {
             rep_selected: None,
             rt,
             settings_ignore_input: String::new(),
+            settings_proxy_addr: "127.0.0.1".to_string(),
+            settings_proxy_port: 8080,
             claude_input: String::new(),
             claude_rx: None,
             claude_thinking: false,
@@ -397,20 +420,36 @@ impl RustmanApp {
     // ── Top toolbar ───────────────────────────────────────────────────────────
     fn draw_topbar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("topbar")
-            .exact_height(38.0)
+            .exact_height(42.0)
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
-                    ui.label(
-                        RichText::new("rustman")
-                            .size(17.0)
-                            .strong()
-                            .color(Color32::from_rgb(64, 192, 255)),
-                    );
-                    ui.label(
-                        RichText::new("127.0.0.1:8080")
-                            .size(12.0)
-                            .color(Color32::GRAY),
-                    );
+                    // Logo — loaded once, displayed at 32×32 px.
+                    let tex = self.logo_texture.get_or_insert_with(|| {
+                        let bytes = include_bytes!("../logo.png");
+                        let img   = image::load_from_memory(bytes)
+                            .expect("logo.png embedded")
+                            .resize(64, 64, image::imageops::FilterType::Lanczos3)
+                            .to_rgba8();
+                        let (w, h) = img.dimensions();
+                        let color_img = egui::ColorImage::from_rgba_unmultiplied(
+                            [w as usize, h as usize],
+                            img.as_flat_samples().as_slice(),
+                        );
+                        ctx.load_texture("rustman_logo", color_img, egui::TextureOptions::LINEAR)
+                    });
+                    ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                        tex.id(),
+                        egui::vec2(32.0, 32.0),
+                    )));
+                    ui.add_space(4.0);
+                    {
+                        let s = self.state.lock().unwrap();
+                        let addr = &s.settings.proxy_addr;
+                        let port = s.settings.proxy_port;
+                        let label = format!("{addr}:{port}");
+                        drop(s);
+                        ui.label(RichText::new(label).size(12.0).color(Color32::GRAY));
+                    }
 
                     ui.separator();
 
@@ -561,9 +600,10 @@ impl RustmanApp {
                     }
                     ActiveTab::Settings => {
                         let s = self.state.lock().unwrap();
+                        let addr = s.settings.proxy_addr.clone();
                         let port = s.settings.proxy_port;
                         let n = s.settings.ignore_hosts.len();
-                        format!("  Settings  ·  proxy 127.0.0.1:{port}  ·  {n} ignore rule(s)")
+                        format!("  Settings  ·  proxy {addr}:{port}  ·  {n} ignore rule(s)")
                     }
                     ActiveTab::Claude => {
                         let s = self.state.lock().unwrap();
@@ -1988,20 +2028,83 @@ impl RustmanApp {
                 // ── Proxy ─────────────────────────────────────────────────
                 section_header(ui, "PROXY");
                 ui.add_space(6.0);
-                let port = self.state.lock().unwrap().settings.proxy_port;
+
+                let (cur_addr, cur_port, restarting) = {
+                    let s = self.state.lock().unwrap();
+                    (s.settings.proxy_addr.clone(), s.settings.proxy_port, s.proxy_restarting)
+                };
+
+                // Sync local fields with actual values on first open / after restart.
+                if !restarting {
+                    if self.settings_proxy_addr.is_empty() {
+                        self.settings_proxy_addr = cur_addr.clone();
+                    }
+                    if self.settings_proxy_port == 8080 && cur_port != 8080 {
+                        self.settings_proxy_port = cur_port;
+                    }
+                }
+
                 ui.horizontal(|ui| {
-                    ui.colored_label(Color32::GRAY, "Listening on");
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new(format!("127.0.0.1:{port}"))
-                            .monospace()
-                            .color(Color32::WHITE),
+                    ui.colored_label(Color32::GRAY, "Address:");
+                    ui.add_space(6.0);
+                    ui.add(
+                        TextEdit::singleline(&mut self.settings_proxy_addr)
+                            .hint_text("127.0.0.1  or  0.0.0.0")
+                            .desired_width(160.0)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                    ui.add_space(8.0);
+                    ui.colored_label(Color32::GRAY, "Port:");
+                    ui.add_space(6.0);
+                    ui.add(
+                        egui::DragValue::new(&mut self.settings_proxy_port)
+                            .range(1024..=65535)
+                            .speed(1.0),
                     );
                 });
-                ui.add_space(2.0);
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let addr_trim = self.settings_proxy_addr.trim().to_string();
+                    let changed = addr_trim != cur_addr || self.settings_proxy_port != cur_port;
+                    let valid   = !addr_trim.is_empty();
+
+                    let btn_text = if restarting { "↻  Restarting…" } else { "Apply" };
+                    let btn = egui::Button::new(
+                        RichText::new(btn_text).size(12.0).color(Color32::WHITE),
+                    )
+                    .fill(if restarting || !changed || !valid {
+                        Color32::from_rgb(50, 50, 60)
+                    } else {
+                        Color32::from_rgb(40, 120, 200)
+                    });
+
+                    let enabled = changed && !restarting && valid;
+                    if ui.add_enabled(enabled, btn).clicked() {
+                        let new_addr = addr_trim;
+                        let new_port = self.settings_proxy_port;
+                        let mut s = self.state.lock().unwrap();
+                        s.proxy_restarting = true;
+                        if let Some(tx) = &s.proxy_restart_tx {
+                            let _ = tx.try_send((new_addr, new_port));
+                        }
+                    }
+
+                    ui.add_space(10.0);
+                    if restarting {
+                        ui.colored_label(Color32::from_rgb(50, 200, 255), "↻ Restarting proxy…");
+                    } else {
+                        ui.colored_label(
+                            Color32::from_rgb(80, 200, 80),
+                            format!("Active  {cur_addr}:{cur_port}"),
+                        );
+                    }
+                });
+
+                ui.add_space(4.0);
                 ui.colored_label(
                     Color32::DARK_GRAY,
-                    "To change the port, restart rustman with a different value.",
+                    "Use 0.0.0.0 to listen on all interfaces. Existing connections are dropped on restart.",
                 );
                 ui.add_space(20.0);
 

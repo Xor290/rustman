@@ -50,19 +50,33 @@ fn client_cfg() -> Arc<rustls::ClientConfig> {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-pub async fn run(state: Shared, ca: Arc<Ca>, port: u16, ready: std::sync::mpsc::SyncSender<Result<u16, String>>) {
-    let listener = match TcpListener::bind(("127.0.0.1", port)).await {
-        Ok(l) => { ready.send(Ok(port)).ok(); l }
+pub async fn run(
+    state: Shared,
+    ca: Arc<Ca>,
+    addr: String,
+    port: u16,
+    ready: std::sync::mpsc::SyncSender<Result<(String, u16), String>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let listener = match TcpListener::bind((addr.as_str(), port)).await {
+        Ok(l)  => { ready.send(Ok((addr, port))).ok(); l }
         Err(e) => { ready.send(Err(e.to_string())).ok(); return; }
     };
     loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
+        // Poll stop flag every 100 ms so the proxy can be cleanly shut down.
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            listener.accept(),
+        ).await {
+            Ok(Ok((stream, _))) => {
                 let s = state.clone();
                 let c = ca.clone();
                 tokio::spawn(async move { dispatch(stream, s, c).await });
             }
-            Err(e) => eprintln!("accept: {e}"),
+            Ok(Err(e)) => eprintln!("accept: {e}"),
+            Err(_) => {
+                if stop.load(std::sync::atomic::Ordering::Relaxed) { break; }
+            }
         }
     }
 }

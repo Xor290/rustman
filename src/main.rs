@@ -31,27 +31,79 @@ fn main() {
 
     let state: app::Shared = Arc::new(Mutex::new(app::AppState::new()));
 
-    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<u16, String>>(0);
-    let proxy_state = state.clone();
-    let proxy_ca = ca.clone();
-    std::thread::spawn(move || {
-        tokio::runtime::Runtime::new()
-            .expect("tokio runtime")
-            .block_on(proxy::run(proxy_state, proxy_ca, 8080, ready_tx));
-    });
+    // ── Proxy manager ─────────────────────────────────────────────────────────
+    // Channel: GUI sends (addr, port) → manager stops the old proxy, starts a new one.
+    let (restart_tx, restart_rx) = std::sync::mpsc::sync_channel::<(String, u16)>(1);
+    state.lock().unwrap().proxy_restart_tx = Some(restart_tx.clone());
 
-    match ready_rx
-        .recv()
-        .unwrap_or_else(|_| Err("proxy thread died".into()))
+    // Start the first proxy instance.
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(String, u16), String>>(0);
+    let initial_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
-        Ok(port) => {
-            eprintln!("[rustman] proxy listening on 127.0.0.1:{port}");
-            state.lock().unwrap().settings.proxy_port = port;
+        let stop  = initial_stop.clone();
+        let s     = state.clone();
+        let c     = ca.clone();
+        let ready = ready_tx;
+        std::thread::spawn(move || {
+            tokio::runtime::Runtime::new()
+                .expect("tokio runtime")
+                .block_on(proxy::run(s, c, "127.0.0.1".to_string(), 8080, ready, stop));
+        });
+    }
+
+    match ready_rx.recv().unwrap_or_else(|_| Err("proxy thread died".into())) {
+        Ok((addr, port)) => {
+            eprintln!("[rustman] proxy listening on {addr}:{port}");
+            let mut s = state.lock().unwrap();
+            s.settings.proxy_addr = addr;
+            s.settings.proxy_port = port;
         }
         Err(e) => {
             eprintln!("[rustman] ERROR: {e}");
             std::process::exit(1);
         }
+    }
+
+    // Background thread: listens for restart requests from the GUI.
+    {
+        let mgr_state = state.clone();
+        let mgr_ca    = ca.clone();
+        let mut cur_stop = initial_stop;
+        std::thread::spawn(move || {
+            for (new_addr, new_port) in restart_rx {
+                // Stop the current proxy.
+                cur_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                // Give it up to 300 ms to stop (accept loop checks every 100 ms).
+                std::thread::sleep(std::time::Duration::from_millis(300));
+
+                let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                cur_stop = stop.clone();
+
+                let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(String, u16), String>>(0);
+                {
+                    let s = mgr_state.clone();
+                    let c = mgr_ca.clone();
+                    let f = stop;
+                    std::thread::spawn(move || {
+                        tokio::runtime::Runtime::new()
+                            .expect("tokio runtime")
+                            .block_on(proxy::run(s, c, new_addr, new_port, ready_tx, f));
+                    });
+                }
+
+                let result = ready_rx.recv().unwrap_or_else(|_| Err("proxy died".into()));
+                let mut st = mgr_state.lock().unwrap();
+                st.proxy_restarting = false;
+                match result {
+                    Ok((addr, port)) => {
+                        eprintln!("[rustman] proxy restarted on {addr}:{port}");
+                        st.settings.proxy_addr = addr;
+                        st.settings.proxy_port = port;
+                    }
+                    Err(e) => eprintln!("[rustman] proxy restart failed: {e}"),
+                }
+            }
+        });
     }
 
     let bg_rt = std::sync::Arc::new(tokio::runtime::Runtime::new().expect("bg runtime"));
