@@ -119,16 +119,12 @@ pub async fn run(
             let links = extract_links(&body, &base_host, base_tls, base_port, &path);
             let mut count = 0;
             for link in links {
-                let variants = attack(&link);
                 let key = canonical(&link);
                 if !visited.contains(&key) {
                     visited.insert(key);
                     queue.push_back((link, depth + 1));
                     count += 1;
                 }
-                let _ = tx.send(CrawlMsg::Attack {
-                    variant: (variants),
-                });
             }
             count
         } else {
@@ -318,12 +314,31 @@ fn resolve(
     }
 }
 
+/// Where in the HTTP request the payload was injected.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AttackTarget {
+    UrlParam(String),
+    Header(String),
+    BodyParam(String),
+}
+
+impl std::fmt::Display for AttackTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AttackTarget::UrlParam(p)  => write!(f, "URL ?{p}"),
+            AttackTarget::Header(h)    => write!(f, "Header {h}"),
+            AttackTarget::BodyParam(p) => write!(f, "Body {p}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AttackVariant {
-    pub url:      String,
-    pub param:    String,
-    pub category: String,
-    pub payload:  String,
+    pub url:         String,
+    pub raw_request: Vec<u8>,
+    pub target:      AttackTarget,
+    pub category:    String,
+    pub payload:     String,
 }
 
 // ── Payload files embedded at compile time ────────────────────────────────────
@@ -357,30 +372,46 @@ fn get_payloads() -> &'static Vec<(String, String)> {
     })
 }
 
-// ── Attack variant generator ──────────────────────────────────────────────────
+// ── Attack variant generators ─────────────────────────────────────────────────
 
+/// Generate all attack variants for a fetched request (URL params + headers + body).
+pub fn attack_request(url: &str, raw: &[u8]) -> Vec<AttackVariant> {
+    let mut out = Vec::new();
+    out.extend(attack_url_params(url, raw));
+    out.extend(attack_headers(url, raw));
+    out.extend(attack_body_params(url, raw));
+    out
+}
+
+/// Backward-compat alias used in the crawler loop (URL params only, no raw needed).
 pub fn attack(link: &str) -> Vec<AttackVariant> {
-    let (base, query) = match link.split_once('?') {
-        Some((b, q)) => (b, q),
-        None => return vec![],
+    attack_url_params(link, &[])
+}
+
+/// Inject payloads into every URL query parameter.
+/// If the URL has no query string, a synthetic `id=` parameter is added.
+fn attack_url_params(url: &str, raw: &[u8]) -> Vec<AttackVariant> {
+    let (base, query_opt) = match url.split_once('?') {
+        Some((b, q)) => (b, Some(q)),
+        None         => (url, None),
     };
 
-    let pairs: Vec<(&str, &str)> = query
-        .split('&')
-        .filter_map(|kv| {
-            let mut it = kv.splitn(2, '=');
-            let k = it.next()?;
-            let v = it.next().unwrap_or("");
-            if k.is_empty() { None } else { Some((k, v)) }
-        })
-        .collect();
-
-    if pairs.is_empty() {
-        return vec![];
-    }
+    let owned;
+    let pairs: Vec<(&str, &str)> = match query_opt {
+        Some(q) => {
+            let p = parse_kv(q);
+            if p.is_empty() { return vec![]; }
+            p
+        }
+        None => {
+            // No query string: synthesize a common injectable param.
+            owned = vec![("id", "1")];
+            owned.iter().map(|(k, v)| (*k, *v)).collect()
+        }
+    };
 
     let payloads = get_payloads();
-    let mut out = Vec::new();
+    let mut out  = Vec::new();
 
     for (target_key, _) in &pairs {
         for (category, payload) in payloads {
@@ -396,16 +427,213 @@ pub fn attack(link: &str) -> Vec<AttackVariant> {
                 .collect::<Vec<_>>()
                 .join("&");
 
+            let new_url = format!("{}?{}", base, new_query);
+            let new_raw = replace_url_in_request(raw, url, &new_url);
             out.push(AttackVariant {
-                url:      format!("{}?{}", base, new_query),
-                param:    target_key.to_string(),
-                category: category.clone(),
-                payload:  payload.clone(),
+                url:         new_url,
+                raw_request: new_raw,
+                target:      AttackTarget::UrlParam(target_key.to_string()),
+                category:    category.clone(),
+                payload:     payload.clone(),
             });
         }
     }
-
     out
+}
+
+/// Inject payloads into injectable request headers.
+fn attack_headers(url: &str, raw: &[u8]) -> Vec<AttackVariant> {
+    const INJECTABLE_HEADERS: &[&str] = &[
+        "User-Agent",
+        "Referer",
+        "X-Forwarded-For",
+        "X-Forwarded-Host",
+        "X-Real-IP",
+        "X-Custom-IP-Authorization",
+        "X-Original-URL",
+        "Accept-Language",
+        "Origin",
+    ];
+
+    let src = match std::str::from_utf8(raw) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+
+    let payloads = get_payloads();
+    let mut out  = Vec::new();
+
+    for header_name in INJECTABLE_HEADERS {
+        let header_lc = header_name.to_ascii_lowercase();
+        let present = src.lines().any(|l| {
+            l.to_ascii_lowercase().starts_with(&format!("{}:", header_lc))
+        });
+
+        for (category, payload) in payloads {
+            // Replace if present, append before blank line if absent.
+            let new_raw = if present {
+                replace_header_value(src, &header_lc, payload)
+            } else {
+                append_header(src, header_name, payload)
+            };
+            out.push(AttackVariant {
+                url:         url.to_string(),
+                raw_request: new_raw,
+                target:      AttackTarget::Header(header_name.to_string()),
+                category:    category.clone(),
+                payload:     payload.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// Inject payloads into form-urlencoded body parameters.
+fn attack_body_params(url: &str, raw: &[u8]) -> Vec<AttackVariant> {
+    let src = match std::str::from_utf8(raw) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+
+    // Only process form-encoded bodies.
+    let is_form = src.lines().any(|l| {
+        l.to_ascii_lowercase().starts_with("content-type:")
+            && l.to_ascii_lowercase().contains("application/x-www-form-urlencoded")
+    });
+    if !is_form { return vec![]; }
+
+    // Body is after the blank line.
+    let body = match src.split_once("\r\n\r\n") {
+        Some((_, b)) => b,
+        None => match src.split_once("\n\n") {
+            Some((_, b)) => b,
+            None => return vec![],
+        },
+    };
+
+    let pairs: Vec<(&str, &str)> = parse_kv(body.trim());
+    if pairs.is_empty() { return vec![]; }
+
+    let payloads = get_payloads();
+    let mut out  = Vec::new();
+
+    for (target_key, _) in &pairs {
+        for (category, payload) in payloads {
+            let new_body: String = pairs
+                .iter()
+                .map(|(k, v)| {
+                    if k == target_key {
+                        format!("{}={}", k, url_encode(payload))
+                    } else {
+                        format!("{}={}", k, v)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("&");
+
+            let new_raw = replace_body(src, &new_body);
+            out.push(AttackVariant {
+                url:         url.to_string(),
+                raw_request: new_raw,
+                target:      AttackTarget::BodyParam(target_key.to_string()),
+                category:    category.clone(),
+                payload:     payload.clone(),
+            });
+        }
+    }
+    out
+}
+
+// ── Request surgery helpers ───────────────────────────────────────────────────
+
+fn parse_kv<'a>(s: &'a str) -> Vec<(&'a str, &'a str)> {
+    s.split('&')
+        .filter_map(|kv| {
+            let mut it = kv.splitn(2, '=');
+            let k = it.next()?;
+            let v = it.next().unwrap_or("");
+            if k.is_empty() { None } else { Some((k, v)) }
+        })
+        .collect()
+}
+
+/// Swap the URL in the request-line (first line) of a raw HTTP request.
+fn replace_url_in_request(raw: &[u8], _old_url: &str, new_url: &str) -> Vec<u8> {
+    if raw.is_empty() {
+        // No existing raw — build a minimal GET request.
+        return format!("GET {new_url} HTTP/1.1\r\nConnection: close\r\n\r\n").into_bytes();
+    }
+    let src = String::from_utf8_lossy(raw);
+    // Extract just the path+query from the new URL.
+    let path = new_url
+        .splitn(3, '/')
+        .skip(2)
+        .next()
+        .map(|s| format!("/{s}"))
+        .unwrap_or_else(|| "/".to_string());
+
+    // Replace only the path portion in the request-line.
+    if let Some(first_end) = src.find("\r\n").or_else(|| src.find('\n')) {
+        let first_line = &src[..first_end];
+        let mut parts = first_line.splitn(3, ' ');
+        let method  = parts.next().unwrap_or("GET");
+        let _old_path = parts.next().unwrap_or("/");
+        let version = parts.next().unwrap_or("HTTP/1.1");
+        let new_first = format!("{method} {path} {version}");
+        let rest = &src[first_end..];
+        return format!("{new_first}{rest}").into_bytes();
+    }
+    raw.to_vec()
+}
+
+/// Append a new header before the blank line that separates headers from body.
+fn append_header(src: &str, header_name: &str, payload: &str) -> Vec<u8> {
+    let sep = if src.contains("\r\n\r\n") { "\r\n\r\n" } else { "\n\n" };
+    match src.split_once(sep) {
+        Some((headers, body)) => {
+            format!("{}\r\n{}: {}{}{}", headers, header_name, payload, sep, body).into_bytes()
+        }
+        None => {
+            format!("{}\r\n{}: {}\r\n\r\n", src, header_name, payload).into_bytes()
+        }
+    }
+}
+
+/// Replace the value of a header in a raw HTTP request string.
+fn replace_header_value(src: &str, header_lc: &str, payload: &str) -> Vec<u8> {
+    let prefix = format!("{}:", header_lc);
+    src.lines()
+        .map(|line| {
+            if line.to_ascii_lowercase().starts_with(&prefix) {
+                let name = &line[..line.find(':').unwrap_or(line.len())];
+                format!("{}: {}", name, payload)
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\r\n")
+        .into_bytes()
+}
+
+/// Replace the body of a raw HTTP request with `new_body`.
+fn replace_body(src: &str, new_body: &str) -> Vec<u8> {
+    let sep = if src.contains("\r\n\r\n") { "\r\n\r\n" } else { "\n\n" };
+    let headers = src.split_once(sep).map(|(h, _)| h).unwrap_or(src);
+    // Fix Content-Length.
+    let new_len = new_body.len();
+    let headers = headers
+        .lines()
+        .map(|l| {
+            if l.to_ascii_lowercase().starts_with("content-length:") {
+                format!("Content-Length: {new_len}")
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\r\n");
+    format!("{headers}{sep}{new_body}").into_bytes()
 }
 
 /// Percent-encode characters that would break a query string.

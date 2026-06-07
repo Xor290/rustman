@@ -75,6 +75,9 @@ impl Default for Settings {
 pub struct AppState {
     pub requests: Vec<Request>,
     pub next_id: usize,
+    /// Monotonic counter incremented on every structural change to `requests`.
+    /// The GUI caches this to skip sync_selection when nothing changed.
+    pub version: u64,
     /// Host currently in focus (set when a top-level navigation is detected).
     /// None = no navigation seen yet → auto-forward everything.
     pub focused_host: Option<String>,
@@ -90,6 +93,7 @@ impl AppState {
         Self {
             requests: Vec::new(),
             next_id: 0,
+            version: 0,
             focused_host: None,
             settings: Settings::default(),
             pending_prompt: None,
@@ -102,6 +106,7 @@ impl AppState {
         self.next_id += 1;
         req.id = id;
         self.requests.push(req);
+        self.version += 1;
         // Prune oldest completed request when over the limit
         let max = self.settings.max_requests;
         if self.requests.len() > max {
@@ -118,6 +123,7 @@ impl AppState {
         if let Some(r) = self.requests.iter_mut().find(|r| r.id == id) {
             r.status = status;
             if response.is_some() { r.response = response; }
+            self.version += 1;
         }
     }
 

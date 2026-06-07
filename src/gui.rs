@@ -75,7 +75,23 @@ struct RustmanApp {
     crawler_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
     crawler_running: bool,
     crawler_selected: Option<usize>,
+    // Attacks are generated lazily (off-thread) when the user selects a crawled entry.
     crawler_attacks: Vec<crate::crawler::AttackVariant>,
+    crawler_attack_selected: Option<usize>,
+    crawler_attacks_for: Option<usize>,
+    // Background generation channel.
+    crawler_attacks_gen_rx: Option<std::sync::mpsc::Receiver<Vec<crate::crawler::AttackVariant>>>,
+    // attack_index → raw response bytes
+    crawler_attack_responses: std::collections::HashMap<usize, Vec<u8>>,
+    // in-flight: (attack_index, receiver)
+    crawler_attack_pending: Option<(usize, std::sync::mpsc::Receiver<Vec<u8>>)>,
+    // O(1) lookup: URL → crawler_entries index (kept in sync with crawler_entries).
+    crawler_entry_index: std::collections::HashMap<String, usize>,
+    // Cached per-frame values (avoids repeated mutex locks).
+    cached_light_mode: bool,
+    cached_pending_prompt: bool,
+    // Version from AppState — lets sync_selection skip when nothing changed.
+    cached_req_version: u64,
 }
 
 impl RustmanApp {
@@ -103,11 +119,27 @@ impl RustmanApp {
             crawler_running: false,
             crawler_selected: None,
             crawler_attacks: Vec::new(),
+            crawler_attack_selected: None,
+            crawler_attacks_for: None,
+            crawler_attacks_gen_rx: None,
+            crawler_attack_responses: std::collections::HashMap::new(),
+            crawler_attack_pending: None,
+            crawler_entry_index: std::collections::HashMap::new(),
+            cached_light_mode: false,
+            cached_pending_prompt: false,
+            cached_req_version: 0,
         }
     }
 
     fn sync_selection(&mut self) {
         let s = self.state.lock().unwrap();
+
+        // Skip all work if nothing in AppState changed and the user hasn't edited.
+        if s.version == self.cached_req_version && !self.dirty {
+            return;
+        }
+        self.cached_req_version = s.version;
+
         let total = s.requests.len();
 
         if let Some(sel) = self.selected {
@@ -143,30 +175,36 @@ impl RustmanApp {
         }
     }
 
-    fn poll_repeater(&mut self) {
+    fn poll_repeater(&mut self) -> bool {
+        let mut changed = false;
         for sess in &mut self.repeater {
             if let Some(rx) = &sess.pending {
                 if let Ok(bytes) = rx.try_recv() {
                     sess.response = Some(String::from_utf8_lossy(&bytes).into_owned());
                     sess.pending = None;
+                    changed = true;
                 }
             }
         }
+        changed
     }
 
-    fn poll_crawler(&mut self) {
+    fn poll_crawler(&mut self, _ctx: &egui::Context) -> bool {
         use crate::crawler::{CrawlMsg, EntryStatus};
-        let rx = match &self.crawler_rx {
-            Some(r) => r,
-            None => return,
-        };
-        loop {
-            match rx.try_recv() {
-                Ok(CrawlMsg::Visiting {
-                    url,
-                    depth,
-                    request,
-                }) => {
+        if self.crawler_rx.is_none() { return false; }
+
+        let mut changed = false;
+        // Cap at 32 messages per frame to keep the UI responsive.
+        for _ in 0..32 {
+            let msg = match &self.crawler_rx {
+                Some(rx) => match rx.try_recv() { Ok(m) => m, Err(_) => break },
+                None => break,
+            };
+            changed = true;
+            match msg {
+                CrawlMsg::Visiting { url, depth, request } => {
+                    let idx = self.crawler_entries.len();
+                    self.crawler_entry_index.insert(url.clone(), idx);
                     self.crawler_entries.push(crate::crawler::CrawlerEntry {
                         url,
                         depth,
@@ -175,21 +213,25 @@ impl RustmanApp {
                         response: Vec::new(),
                     });
                 }
-                Ok(CrawlMsg::Done {
-                    url,
-                    status,
-                    new_links,
-                    response,
-                }) => {
-                    if let Some(e) = self.crawler_entries.iter_mut().rfind(|e| e.url == url) {
-                        e.status = EntryStatus::Done(status, new_links);
-                        e.response = response;
+                CrawlMsg::Done { url, status, new_links, response } => {
+                    if let Some(&i) = self.crawler_entry_index.get(&url) {
+                        if let Some(e) = self.crawler_entries.get_mut(i) {
+                            e.status   = EntryStatus::Done(status, new_links);
+                            e.response = response;
+                            if self.crawler_selected == Some(i) {
+                                self.crawler_attacks_for = None;
+                            }
+                        }
                     }
                 }
-                Ok(CrawlMsg::Failed { url, reason }) => {
-                    if let Some(e) = self.crawler_entries.iter_mut().rfind(|e| e.url == url) {
-                        e.status = EntryStatus::Failed(reason);
+                CrawlMsg::Failed { url, reason } => {
+                    if let Some(&i) = self.crawler_entry_index.get(&url) {
+                        if let Some(e) = self.crawler_entries.get_mut(i) {
+                            e.status = EntryStatus::Failed(reason);
+                        }
                     } else {
+                        let idx = self.crawler_entries.len();
+                        self.crawler_entry_index.insert(url.clone(), idx);
                         self.crawler_entries.push(crate::crawler::CrawlerEntry {
                             url,
                             depth: 0,
@@ -199,20 +241,28 @@ impl RustmanApp {
                         });
                     }
                 }
-                Ok(CrawlMsg::Attack { variant }) => {
-                    self.crawler_attacks.extend(variant);
-                }
-                Ok(CrawlMsg::Finished) => {
+                CrawlMsg::Attack { .. } => {}
+                CrawlMsg::Finished => {
                     self.crawler_running = false;
                     self.crawler_rx = None;
                     break;
                 }
-                Err(_) => break,
             }
         }
+        changed
     }
 
-    fn poll_claude(&mut self) {
+    fn poll_attacks_gen(&mut self) -> bool {
+        let variants = match &self.crawler_attacks_gen_rx {
+            Some(rx) => match rx.try_recv() { Ok(v) => v, Err(_) => return false },
+            None => return false,
+        };
+        self.crawler_attacks = variants;
+        self.crawler_attacks_gen_rx = None;
+        true
+    }
+
+    fn poll_claude(&mut self) -> bool {
         if let Some(rx) = &self.claude_rx {
             if let Ok(result) = rx.try_recv() {
                 let text = match result {
@@ -225,8 +275,23 @@ impl RustmanApp {
                 });
                 self.claude_thinking = false;
                 self.claude_rx = None;
+                return true;
             }
         }
+        false
+    }
+
+    fn poll_attack(&mut self) -> bool {
+        let (idx, bytes) = match &self.crawler_attack_pending {
+            Some((i, rx)) => match rx.try_recv() {
+                Ok(b)  => (*i, b),
+                Err(_) => return false,
+            },
+            None => return false,
+        };
+        self.crawler_attack_responses.insert(idx, bytes);
+        self.crawler_attack_pending = None;
+        true
     }
 
     fn send_selected_to_repeater(&mut self) {
@@ -263,15 +328,40 @@ impl RustmanApp {
 
 impl eframe::App for RustmanApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint_after(std::time::Duration::from_millis(40));
+        // Adaptive repaint: fast when something is in-flight (spinner), slow when idle.
+        let has_inflight = self.crawler_running
+            || self.crawler_attack_pending.is_some()
+            || self.crawler_attacks_gen_rx.is_some()
+            || self.claude_thinking;
+        ctx.request_repaint_after(std::time::Duration::from_millis(
+            if has_inflight { 80 } else { 500 },
+        ));
+
+        // Single mutex lock per frame for all cached values.
         {
-            let light = self.state.lock().unwrap().settings.light_mode;
-            ctx.set_visuals(if light { light_theme() } else { dark_theme() });
+            let s = self.state.lock().unwrap();
+            let light   = s.settings.light_mode;
+            let pending = s.pending_prompt.is_some();
+            if light != self.cached_light_mode {
+                self.cached_light_mode = light;
+                ctx.set_visuals(if light { light_theme() } else { dark_theme() });
+            }
+            self.cached_pending_prompt = pending;
         }
-        self.sync_selection();
-        self.poll_repeater();
-        self.poll_crawler();
-        self.poll_claude();
+
+        // sync_selection is only needed on the Proxy tab (locks mutex internally).
+        if self.tab == ActiveTab::Proxy {
+            self.sync_selection();
+        }
+
+        let repaint = self.poll_repeater()
+            | self.poll_crawler(ctx)
+            | self.poll_claude()
+            | self.poll_attack()
+            | self.poll_attacks_gen();
+        if repaint {
+            ctx.request_repaint();
+        }
 
         if self.tab == ActiveTab::Proxy
             && ctx.input(|i| i.key_pressed(egui::Key::R) && i.modifiers.ctrl)
@@ -370,7 +460,7 @@ impl RustmanApp {
                         self.tab = ActiveTab::Settings;
                     }
 
-                    let has_pending = self.state.lock().unwrap().pending_prompt.is_some();
+                    let has_pending = self.cached_pending_prompt;
                     let claude_label = if has_pending { "Claude ●" } else { "Claude" };
                     let claude_btn = egui::SelectableLabel::new(
                         self.tab == ActiveTab::Claude,
@@ -1071,7 +1161,12 @@ impl RustmanApp {
                         ).fill(Color32::from_rgb(60, 180, 80));
                         if ui.add(start_btn).clicked() && !self.crawler_url.trim().is_empty() {
                             self.crawler_entries.clear();
+                            self.crawler_entry_index.clear();
                             self.crawler_attacks.clear();
+                            self.crawler_attacks_for = None;
+                            self.crawler_attacks_gen_rx = None;
+                            self.crawler_attack_responses.clear();
+                            self.crawler_attack_pending = None;
                             self.crawler_selected = None;
                             self.crawler_running = true;
 
@@ -1092,7 +1187,12 @@ impl RustmanApp {
                             ui.add_space(4.0);
                             if ui.button(RichText::new("Clear").color(Color32::from_rgb(150, 150, 150))).clicked() {
                                 self.crawler_entries.clear();
+                                self.crawler_entry_index.clear();
                                 self.crawler_attacks.clear();
+                                self.crawler_attacks_for = None;
+                                self.crawler_attacks_gen_rx = None;
+                                self.crawler_attack_responses.clear();
+                                self.crawler_attack_pending = None;
                                 self.crawler_selected = None;
                             }
                         }
@@ -1203,6 +1303,10 @@ impl RustmanApp {
 
                             if resp.clicked() {
                                 self.crawler_selected = Some(i);
+                                // Invalidate lazy attack cache + clear responses for new entry.
+                                self.crawler_attacks_for = None;
+                                self.crawler_attack_responses.clear();
+                                self.crawler_attack_pending = None;
                             }
                         }
                     });
@@ -1276,11 +1380,37 @@ impl RustmanApp {
             ui.add(egui::Separator::default().spacing(4.0));
 
             let available_h = ui.available_height();
-            let has_resp = !entry.response.is_empty();
-            let req_h = if has_resp {
-                available_h * 0.40
+            let has_resp    = !entry.response.is_empty();
+
+            // Kick off background attack generation when entry is done and not yet generated.
+            let is_done      = matches!(entry.status, crate::crawler::EntryStatus::Done(..));
+            let already_done = self.crawler_attacks_for == Some(idx);
+            let generating   = self.crawler_attacks_gen_rx.is_some();
+            if is_done && !already_done && !generating {
+                // Clones happen only here, not every frame.
+                let url = entry.url.clone();
+                let raw = entry.request.clone();
+                let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                self.crawler_attacks_gen_rx = Some(rx);
+                self.crawler_attacks_for = Some(idx);
+                self.crawler_attack_selected = None;
+                std::thread::spawn(move || {
+                    let variants = crate::crawler::attack_request(&url, &raw);
+                    let _ = tx.send(variants);
+                });
+            }
+
+            let attack_count = self.crawler_attacks.len();
+            let has_attacks  = attack_count > 0 && already_done;
+
+            let (req_h, resp_h, atk_h) = if has_resp && has_attacks {
+                (available_h * 0.28, available_h * 0.28, available_h * 0.40)
+            } else if has_resp {
+                (available_h * 0.40, available_h * 0.56, 0.0)
+            } else if has_attacks {
+                (available_h * 0.35, 0.0, available_h * 0.61)
             } else {
-                available_h
+                (available_h, 0.0, 0.0)
             };
 
             // Request
@@ -1325,7 +1455,7 @@ impl RustmanApp {
                     ui.add_space(4.0);
                     ScrollArea::vertical()
                         .id_salt(format!("crawl_resp_{idx}"))
-                        .max_height(available_h * 0.54)
+                        .max_height(resp_h - 36.0)
                         .show(ui, |ui| {
                             let mut t = resp_text;
                             ui.add(
@@ -1337,6 +1467,230 @@ impl RustmanApp {
                                     .text_color(Color32::from_rgb(180, 210, 180)),
                             );
                         });
+                });
+            }
+
+            // Show generating indicator while background thread runs.
+            if generating && !already_done {
+                ui.add_space(4.0);
+                egui::Frame::none()
+                    .fill(Color32::from_rgb(22, 18, 28))
+                    .rounding(4.0)
+                    .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                    .show(ui, |ui| {
+                        ui.colored_label(Color32::from_rgb(50, 200, 255),
+                            RichText::new("↻  Generating attack variants…").size(12.0));
+                    });
+            }
+
+            // Attacks panel
+            if has_attacks {
+                ui.add_space(4.0);
+                let atk_frame = egui::Frame::none()
+                    .fill(Color32::from_rgb(22, 18, 28))
+                    .rounding(4.0)
+                    .inner_margin(egui::Margin::symmetric(8.0, 6.0));
+
+                atk_frame.show(ui, |ui| {
+                    let pending_ai = self.crawler_attack_pending.as_ref().map(|(i, _)| *i);
+                    let selected_atk = self.crawler_attack_selected;
+
+                    // ── List (top portion) ────────────────────────────────
+                    ui.horizontal(|ui| {
+                        ui.colored_label(Color32::from_rgb(200, 100, 200),
+                            format!("ATTACKS  ({attack_count})"));
+                        if pending_ai.is_some() {
+                            ui.add_space(8.0);
+                            ui.colored_label(Color32::from_rgb(50, 200, 255),
+                                RichText::new("↻ sending…").size(11.0));
+                        }
+                    });
+                    ui.add_space(4.0);
+
+                    ui.horizontal(|ui| {
+                        ui.add_space(4.0);
+                        ui.colored_label(Color32::DARK_GRAY, RichText::new(format!("{:<14}", "CATEGORY")).monospace().size(10.0));
+                        ui.add_space(4.0);
+                        ui.colored_label(Color32::DARK_GRAY, RichText::new(format!("{:<22}", "TARGET")).monospace().size(10.0));
+                        ui.add_space(4.0);
+                        ui.colored_label(Color32::DARK_GRAY, RichText::new("PAYLOAD").monospace().size(10.0));
+                    });
+                    ui.add(egui::Separator::default().spacing(2.0));
+
+                    let list_h = if selected_atk.is_some() { atk_h * 0.30 } else { atk_h - 32.0 };
+
+                    // Collect clicks outside borrow to avoid issues.
+                    let mut clicked_ai: Option<usize> = None;
+
+                    ScrollArea::vertical()
+                        .id_salt(format!("crawl_atk_scroll_{idx}"))
+                        .max_height(list_h)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for ai in 0..self.crawler_attacks.len() {
+                                let atk     = &self.crawler_attacks[ai];
+                                let is_sel  = selected_atk == Some(ai);
+                                let has_resp = self.crawler_attack_responses.contains_key(&ai);
+                                let sending  = pending_ai == Some(ai);
+                                let row_h   = 20.0;
+                                let avail_w = ui.available_width();
+                                let (rect, resp) = ui.allocate_exact_size(
+                                    Vec2::new(avail_w, row_h), egui::Sense::click());
+
+                                let bg = if is_sel {
+                                    Color32::from_rgb(55, 35, 65)
+                                } else if resp.hovered() {
+                                    Color32::from_rgb(35, 28, 45)
+                                } else {
+                                    Color32::TRANSPARENT
+                                };
+                                ui.painter().rect_filled(rect, 0.0, bg);
+
+                                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(4.0);
+                                        let cat_color = match atk.category.as_str() {
+                                            "SQLi"           => Color32::from_rgb(255, 140, 60),
+                                            "XSS"            => Color32::from_rgb(255, 220, 60),
+                                            "CMDi"           => Color32::from_rgb(200, 80, 80),
+                                            "PathTraversal"  => Color32::from_rgb(100, 200, 255),
+                                            "SSRF"           => Color32::from_rgb(100, 255, 180),
+                                            "SSTI"           => Color32::from_rgb(220, 100, 255),
+                                            "OpenRedirect"   => Color32::from_rgb(255, 160, 200),
+                                            "RCE"            => Color32::from_rgb(255, 60, 60),
+                                            _                => Color32::GRAY,
+                                        };
+                                        ui.colored_label(cat_color,
+                                            RichText::new(format!("{:<14}", &atk.category)).monospace().size(10.0));
+                                        ui.add_space(4.0);
+                                        let target_str = format!("{}", atk.target);
+                                        ui.colored_label(Color32::from_rgb(160, 160, 200),
+                                            RichText::new(format!("{:<22}", &target_str)).monospace().size(10.0));
+                                        ui.add_space(4.0);
+                                        let payload_preview = if atk.payload.len() > 55 {
+                                            format!("{}…", &atk.payload[..52])
+                                        } else {
+                                            atk.payload.clone()
+                                        };
+                                        ui.colored_label(Color32::from_rgb(200, 200, 120),
+                                            RichText::new(&payload_preview).monospace().size(10.0));
+                                        // Status indicator
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            ui.add_space(4.0);
+                                            if sending {
+                                                ui.colored_label(Color32::from_rgb(50, 200, 255),
+                                                    RichText::new("↻").size(10.0));
+                                            } else if has_resp {
+                                                ui.colored_label(Color32::from_rgb(80, 200, 80),
+                                                    RichText::new("✓").size(10.0));
+                                            }
+                                        });
+                                    });
+                                });
+
+                                if resp.clicked() {
+                                    clicked_ai = Some(ai);
+                                }
+                            }
+                        });
+
+                    // Process click: select + fire request immediately.
+                    if let Some(ai) = clicked_ai {
+                        if self.crawler_attack_selected != Some(ai) {
+                            self.crawler_attack_selected = Some(ai);
+                            // Fire the request if no response cached yet and not already in-flight.
+                            if !self.crawler_attack_responses.contains_key(&ai)
+                                && self.crawler_attack_pending.as_ref().map(|(i, _)| *i) != Some(ai)
+                            {
+                                if let Some(atk) = self.crawler_attacks.get(ai) {
+                                    if let Some(parts) = crate::crawler::parse_url(&atk.url) {
+                                        let raw  = atk.raw_request.clone();
+                                        let host = parts.host;
+                                        let port = parts.port;
+                                        let tls  = parts.tls;
+                                        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                                        self.crawler_attack_pending = Some((ai, rx));
+                                        self.rt.spawn(async move {
+                                            let resp = crate::proxy::repeater_send(&host, port, tls, raw).await;
+                                            let _ = tx.send(resp);
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // ── Request / Response panes ──────────────────────────
+                    if let Some(ai) = self.crawler_attack_selected {
+                        if let Some(atk) = self.crawler_attacks.get(ai) {
+                            ui.add_space(4.0);
+                            ui.add(egui::Separator::default().spacing(2.0));
+
+                            let detail_h  = atk_h * 0.65;
+                            let half_h    = detail_h * 0.48;
+                            let req_text  = String::from_utf8_lossy(&atk.raw_request).into_owned();
+                            let resp_text = self.crawler_attack_responses.get(&ai)
+                                .map(|b| String::from_utf8_lossy(b).into_owned());
+
+                            // Request pane
+                            egui::Frame::none()
+                                .fill(Color32::from_rgb(20, 22, 28))
+                                .rounding(3.0)
+                                .inner_margin(egui::Margin::symmetric(6.0, 4.0))
+                                .show(ui, |ui| {
+                                    ui.set_max_height(half_h);
+                                    ui.colored_label(Color32::DARK_GRAY,
+                                        format!("REQUEST  {}  {}", atk.category, atk.target));
+                                    ui.add_space(2.0);
+                                    ScrollArea::vertical()
+                                        .id_salt(format!("atk_req_{ai}"))
+                                        .max_height(half_h - 28.0)
+                                        .show(ui, |ui| {
+                                            let mut t = req_text;
+                                            ui.add(TextEdit::multiline(&mut t)
+                                                .font(egui::TextStyle::Monospace)
+                                                .desired_width(f32::INFINITY)
+                                                .interactive(false)
+                                                .frame(false)
+                                                .text_color(Color32::from_rgb(210, 210, 220)));
+                                        });
+                                });
+
+                            ui.add_space(3.0);
+
+                            // Response pane
+                            egui::Frame::none()
+                                .fill(Color32::from_rgb(18, 22, 26))
+                                .rounding(3.0)
+                                .inner_margin(egui::Margin::symmetric(6.0, 4.0))
+                                .show(ui, |ui| {
+                                    ui.set_max_height(half_h);
+                                    ui.colored_label(Color32::DARK_GRAY, "RESPONSE");
+                                    ui.add_space(2.0);
+                                    match resp_text {
+                                        Some(t) => {
+                                            ScrollArea::vertical()
+                                                .id_salt(format!("atk_resp_{ai}"))
+                                                .max_height(half_h - 28.0)
+                                                .show(ui, |ui| {
+                                                    let mut s = t;
+                                                    ui.add(TextEdit::multiline(&mut s)
+                                                        .font(egui::TextStyle::Monospace)
+                                                        .desired_width(f32::INFINITY)
+                                                        .interactive(false)
+                                                        .frame(false)
+                                                        .text_color(Color32::from_rgb(180, 210, 180)));
+                                                });
+                                        }
+                                        None => {
+                                            ui.colored_label(
+                                                Color32::from_rgb(50, 200, 255),
+                                                RichText::new("↻  sending request…").size(12.0));
+                                        }
+                                    }
+                                });
+                        }
+                    }
                 });
             }
         });
