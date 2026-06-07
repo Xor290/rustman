@@ -1,6 +1,6 @@
 # rustman
 
-A MITM proxy and web security testing tool written in Rust — similar to Burp Suite, with an integrated Claude AI assistant for OWASP-guided penetration testing.
+**Rustman** is an open-source MITM proxy and web security testing tool built in Rust. It intercepts and inspects HTTP/HTTPS traffic, replays requests via a built-in Repeater, and crawls websites to automatically inject OWASP Top 10 payloads across URL parameters, headers, and request bodies. It features a native GUI, a Claude AI assistant for pentest analysis, and an MCP server for Claude Code integration.
 
 ---
 
@@ -10,10 +10,11 @@ A MITM proxy and web security testing tool written in Rust — similar to Burp S
 |---|---|
 | **Proxy** | Intercept, inspect, edit and forward/drop HTTP(S) requests in real time |
 | **Repeater** | Replay and modify captured requests manually |
-| **Crawler** | Recursive BFS link follower for a target domain |
+| **Crawler** | Recursive BFS crawler with automatic OWASP payload injection |
+| **Attacks** | 240+ payloads per category injected into URL params, headers and body |
 | **Claude** | In-app AI assistant (Anthropic API) with Pentest mode |
 | **MCP Server** | Expose proxy tools to Claude Code via Model Context Protocol |
-| **Settings** | Intercept toggle, ignore list, API key, light/dark theme |
+| **Settings** | Configurable bind address/port, intercept toggle, ignore list, theme |
 
 ---
 
@@ -26,12 +27,14 @@ graph TB
         GUI["GUI Thread\negui / eframe"]
         PROXY["Proxy Thread\nTokio runtime #1\n127.0.0.1:8080"]
         BGRT["Background Runtime\nTokio runtime #2"]
+        PROXY_MGR["Proxy Manager Thread\nhandles port/addr restarts"]
 
         subgraph BGRT
             REPEATER["Repeater tasks"]
             CRAWLER["Crawler tasks"]
             MCP["MCP HTTP Server\n127.0.0.1:8099/mcp"]
             CLAUDE_API["Anthropic API calls"]
+            ATK_GEN["Attack generation\nstd::thread (off UI)"]
         end
 
         STATE["AppState\nArc&lt;Mutex&lt;AppState&gt;&gt;"]
@@ -39,9 +42,10 @@ graph TB
         GUI <-->|"lock / read-write"| STATE
         PROXY <-->|"lock / push requests"| STATE
         BGRT <-->|"lock / read-write"| STATE
+        PROXY_MGR <-->|"restart channel"| STATE
     end
 
-    BROWSER["Browser\n(FoxyProxy → 127.0.0.1:8080)"]
+    BROWSER["Browser\n(proxy → configured addr:port)"]
     TARGET["Target Server"]
     CLAUDE_CODE["Claude Code IDE"]
     ANTHROPIC["Anthropic API\napi.anthropic.com"]
@@ -62,7 +66,7 @@ graph TB
 ```mermaid
 sequenceDiagram
     participant B as Browser
-    participant P as Proxy (8080)
+    participant P as Proxy
     participant CA as CA (rcgen)
     participant S as Target Server
 
@@ -117,6 +121,52 @@ flowchart TD
 
 ---
 
+## Crawler & Attack Flow
+
+```mermaid
+flowchart TD
+    START["User enters URL + depth"] --> QUEUE["BFS Queue"]
+    QUEUE --> POP["Pop (url, depth)"]
+    POP --> STOP{"stop flag?"}
+    STOP -->|"true"| DONE["Finished"]
+    STOP -->|"false"| FETCH["GET request\nrepeater_send()"]
+    FETCH --> MSG["CrawlMsg::Done\n(status, response)"]
+    MSG --> CRAWL{"200 & depth < max?"}
+    CRAWL -->|"No"| POP
+    CRAWL -->|"Yes"| EXTRACT["extract_links()\nsame-domain only"]
+    EXTRACT --> ENQUEUE["Enqueue new URLs"]
+    ENQUEUE --> POP
+
+    MSG --> SELECT["User selects entry"]
+    SELECT --> ATK_GEN["std::thread\nattack_request(url, raw)"]
+    ATK_GEN --> URL_PARAMS["Inject into\nURL parameters"]
+    ATK_GEN --> HEADERS["Inject into\n9 injectable headers"]
+    ATK_GEN --> BODY["Inject into\nform body params"]
+    URL_PARAMS & HEADERS & BODY --> VARIANTS["~2400 AttackVariants\n8 categories × 240 payloads"]
+    VARIANTS --> CLICK["User clicks variant"]
+    CLICK --> SEND["repeater_send() in bg"]
+    SEND --> RESP["Show request + response"]
+```
+
+---
+
+## OWASP Payload Categories
+
+| Category | Payloads | Injection targets |
+|---|---|---|
+| **SQLi** | 30 | URL params, body, headers |
+| **XSS** | 30 | URL params, body, headers |
+| **CMDi** | 36 | URL params, body, headers |
+| **Path Traversal** | 30 | URL params, body, headers |
+| **SSRF** | 32 | URL params, body, headers |
+| **SSTI** | 30 | URL params, body, headers |
+| **Open Redirect** | 30 | URL params, body, headers |
+| **RCE** | 30 | URL params, body, headers |
+
+Payloads are embedded at compile time from `payload/*.json`. Headers tested: `User-Agent`, `Referer`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Real-IP`, `X-Custom-IP-Authorization`, `X-Original-URL`, `Accept-Language`, `Origin`.
+
+---
+
 ## Repeater Flow
 
 ```mermaid
@@ -129,42 +179,16 @@ sequenceDiagram
     Note over GUI: Creates RepeaterSession\n(host, port, tls, raw request)
 
     GUI->>RT: spawn repeater_send(host, port, tls, bytes)
-    Note over RT: rewrite() adds Connection: close
     RT->>SRV: TCP / TLS connect
     RT->>SRV: Send raw HTTP request
     SRV-->>RT: HTTP response
-    RT-->>RT: drain() until EOF
     RT->>GUI: tx.send(response bytes)
-
     GUI->>GUI: poll_repeater() → display response
 ```
 
 ---
 
-## Crawler Flow
-
-```mermaid
-flowchart TD
-    START["User enters URL\n+ max depth"] --> PARSE["parse_url()\nextract host, port, tls"]
-    PARSE --> QUEUE["BFS Queue\n[(url, depth=0)]"]
-    QUEUE --> POP["Pop (url, depth)"]
-    POP --> STOP{"stop flag?"}
-    STOP -->|"true"| DONE["CrawlMsg::Finished"]
-    STOP -->|"false"| REQ["Build GET request\nUser-Agent: rustman-crawler"]
-    REQ --> SEND["repeater_send()\nreuse TLS stack"]
-    SEND --> RESP["HTTP Response"]
-    RESP --> MSG1["CrawlMsg::Done\n(status, response)"]
-    MSG1 --> CRAWL{"status=200\nand depth < max?"}
-    CRAWL -->|"No"| POP
-    CRAWL -->|"Yes"| EXTRACT["extract_links()\nhref= scanning"]
-    EXTRACT --> FILTER["Filter:\n- same domain only\n- skip .png .js .css…\n- deduplicate (HashSet)"]
-    FILTER --> ENQUEUE["Enqueue new URLs\nCrawlMsg::new_links count"]
-    ENQUEUE --> POP
-```
-
----
-
-## Claude AI — Direct API Flow (Claude tab)
+## Claude AI — Direct API Flow
 
 ```mermaid
 sequenceDiagram
@@ -181,17 +205,14 @@ sequenceDiagram
     loop Tool use rounds (max 10)
         RT->>ANT: POST /v1/messages\n(messages, tools, system_prompt)
         ANT-->>RT: {stop_reason: "tool_use", content: [...]}
-
         RT->>ST: execute_tool(name, input)
         Note over RT,ST: list_requests / get_requests\nforward_request / drop_request
-
-        RT->>ANT: POST /v1/messages\n(+ tool_result)
+        RT->>ANT: POST /v1/messages (+ tool_result)
     end
 
-    ANT-->>RT: {stop_reason: "end_turn", content: [{type:"text"}]}
+    ANT-->>RT: {stop_reason: "end_turn"}
     RT->>GUI: tx.send(Ok(text))
-    GUI->>ST: push ChatMessage{from_user: false, text}
-    GUI->>U: Display reply in chat bubble
+    GUI->>ST: push ChatMessage{from_user: false}
 ```
 
 ---
@@ -201,66 +222,27 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant CC as Claude Code (IDE)
-    participant MCP as MCP Server\n(8099/mcp)
+    participant MCP as MCP Server (8099/mcp)
     participant ST as AppState
 
-    CC->>MCP: POST /mcp\ninitialize
+    CC->>MCP: initialize
     MCP-->>CC: capabilities {tools, prompts}
 
-    CC->>MCP: prompts/list
-    MCP-->>CC: ["pentest-analyst", "general-assistant"]
-
     CC->>MCP: prompts/get "pentest-analyst"
-    MCP-->>CC: PromptMessage (system prompt text)
-    Note over CC: Claude Code injects\npentest system prompt
+    MCP-->>CC: Senior pentester system prompt
 
     CC->>MCP: tools/call list_requests {method: "POST"}
     MCP->>ST: lock → filter requests
-    MCP-->>CC: [{id:3, method:"POST", url:"/login"...}]
+    MCP-->>CC: [{id, method, url, status}]
 
-    CC->>MCP: tools/call get_requests {method: "POST"}
-    MCP->>ST: lock → raw + response
-    MCP-->>CC: [{raw:"POST /login...", response:"HTTP 200..."}]
-
-    Note over CC: Claude generates SQLi payload
-    CC->>CC: Show payload to user, ask confirmation
-
-    CC->>MCP: tools/call forward_request {id:3, raw:"POST /login... ' OR 1=1--"}
+    CC->>MCP: tools/call forward_request {id, raw}
     MCP->>ST: forward_at(idx, modified_bytes)
-    MCP-->>CC: "ok: request 3 forwarded"
+    MCP-->>CC: "ok: request forwarded"
 ```
 
----
+**Available MCP tools:** `list_requests`, `get_requests`, `forward_request`, `drop_request`, `get_user_prompt`, `reply_to_user`
 
-## OWASP Testing Workflow
-
-```mermaid
-flowchart LR
-    subgraph intercept["1 · Intercept"]
-        B["Browser\n→ target site"] --> P["Proxy captures\nPOST /login"]
-    end
-
-    subgraph analyse["2 · Analyse"]
-        P --> LR["list_requests('POST')"]
-        LR --> GR["get_requests('POST')\nread raw bytes"]
-    end
-
-    subgraph generate["3 · Generate payloads"]
-        GR --> A["Claude\nidentifies injection point\n(username= parameter)"]
-        A --> PL["Generates OWASP payloads:\n' OR 1=1--\n' UNION SELECT...\n<script>alert(1)</script>\n../../../etc/passwd"]
-    end
-
-    subgraph confirm["4 · Confirm"]
-        PL --> USR{"User\nconfirms?"}
-        USR -->|"Yes"| FWD["forward_request(id, raw)"]
-        USR -->|"No"| DROP["drop_request(id)\nor skip"]
-    end
-
-    subgraph report["5 · Report"]
-        FWD --> RESP["Read response\nin Proxy / Repeater"]
-        RESP --> RPT["Claude generates\npentest report:\nSummary / Hypotheses\nImpact / Remediation\nPriority: Critical"]
-    end
-```
+**Available MCP prompts:** `pentest-analyst`, `general-assistant`
 
 ---
 
@@ -268,7 +250,7 @@ flowchart LR
 
 ### 1. Install the CA certificate
 
-On first launch, rustman generates a CA certificate and attempts to auto-install it into Firefox.
+On first launch rustman generates a CA certificate and attempts to auto-install it into Firefox.
 
 ```
 [rustman] CA cert: /home/<user>/.local/share/rustman/ca.pem
@@ -286,11 +268,11 @@ For Chrome / system trust store, import `ca.pem` manually.
 
 ### 2. Configure your browser
 
-Set your browser's HTTP/HTTPS proxy to `127.0.0.1:8080` (e.g. via FoxyProxy).
+Set your browser HTTP/HTTPS proxy to the address shown in the top bar (default `127.0.0.1:8080`). The address and port can be changed at runtime in **Settings → Proxy**.
 
 ### 3. Configure Claude (optional)
 
-Go to **Settings → CLAUDE API** and enter your Anthropic API key (`sk-ant-…`).
+Go to **Settings → Claude API** and enter your Anthropic API key (`sk-ant-…`).
 
 ### 4. Connect Claude Code (optional)
 
@@ -307,11 +289,6 @@ Add to your Claude Code MCP config:
 }
 ```
 
-Then in Claude Code:
-```
-/mcp get prompt pentest-analyst
-```
-
 ---
 
 ## Build
@@ -323,10 +300,12 @@ cargo build
 # Release
 cargo build --release
 
-# Windows executable (from Linux)
+# Windows executable (from Linux, requires MinGW)
 rustup target add x86_64-pc-windows-gnu
 cargo build --release --target x86_64-pc-windows-gnu
 ```
+
+> On Windows builds, `build.rs` automatically converts `logo.png` to a multi-size `.ico` and embeds it as the `.exe` resource icon.
 
 ---
 
@@ -347,19 +326,21 @@ Displays all intercepted requests for the focused host. Select a request to view
 Manually replay requests with custom edits. Multiple sessions, each with its own request editor and response viewer.
 
 ### Crawler
-Recursive BFS crawler for a target URL. Follows internal links only, skips static assets. Click any entry to inspect its request/response. Send directly to Repeater with **→ Repeater**.
+Recursive BFS crawler. Click any entry to see its request/response. When a page finishes loading, attack variants are generated in a background thread — click any variant to fire the request and see the real server response side by side.
 
 ### Claude
-In-app AI assistant. Switch between **General** and **Pentest** modes. In Pentest mode every response follows the structured report format (Summary / Observations / Hypotheses / Validation / Impact / Remediation / Priority).
+In-app AI assistant. Switch between **General** and **Pentest** modes. In Pentest mode every response follows the structured report format: Summary / Observations / Hypotheses / Validation / Impact / Remediation / Priority.
 
 ### Settings
+
 | Setting | Description |
 |---|---|
 | Light mode | Toggle dark/light theme |
 | Intercept | Enable or disable request interception |
-| Ignore list | Hosts silently forwarded (substring match) |
-| Proxy port | Read-only — set at startup |
-| Max requests | Prune oldest completed requests when exceeded |
+| Ignore list | Hosts silently forwarded (case-insensitive substring) |
+| Proxy address | Bind IP — use `0.0.0.0` to expose on all interfaces |
+| Proxy port | 1024–65535 — applied instantly without restart |
+| Max requests | Prune oldest completed requests when the limit is reached |
 | Claude API key | Anthropic key for the Claude tab |
 
 ---
@@ -367,14 +348,25 @@ In-app AI assistant. Switch between **General** and **Pentest** modes. In Pentes
 ## Project structure
 
 ```
-src/
-├── main.rs          — entry point, proxy + MCP spawn
-├── app.rs           — shared state (AppState, Request, Settings, ChatMessage)
-├── proxy.rs         — MITM proxy, TLS interception, request routing
-├── ca.rs            — dynamic certificate authority (rcgen)
-├── gui.rs           — egui/eframe UI (all tabs)
-├── repeater.rs      — (logic in proxy.rs repeater_send)
-├── crawler.rs       — BFS web crawler
-├── mcp.rs           — MCP HTTP server (tools + prompts)
-└── claude_client.rs — Anthropic API client with tool-use loop
+rustman/
+├── build.rs             — Windows .exe icon embedding (winres + ico)
+├── logo.png             — Application logo (embedded at compile time)
+├── payload/
+│   ├── sqli.json
+│   ├── xss.json
+│   ├── cmdi.json
+│   ├── path_traversal.json
+│   ├── ssrf.json
+│   ├── ssti.json
+│   ├── open_redirect.json
+│   └── rce.json
+└── src/
+    ├── main.rs          — Entry point, proxy manager thread, MCP spawn
+    ├── app.rs           — Shared state (AppState, Request, Settings)
+    ├── proxy.rs         — MITM proxy, TLS interception, stoppable accept loop
+    ├── ca.rs            — Dynamic certificate authority (rcgen)
+    ├── gui.rs           — egui/eframe UI (all tabs, adaptive repaint)
+    ├── crawler.rs       — BFS crawler, OWASP attack generation
+    ├── mcp.rs           — MCP HTTP server (tools + prompts)
+    └── claude_client.rs — Anthropic API client with tool-use loop
 ```
