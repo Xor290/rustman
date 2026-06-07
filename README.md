@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="logo.png" alt="Rustman" width="120" />
+  <img src="logo.png" alt="Rustman" width="200" />
 </p>
 
 # rustman
