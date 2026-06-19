@@ -4,6 +4,7 @@ mod claude_client;
 mod crawler;
 mod gui;
 mod mcp;
+mod openapi;
 mod proxy;
 mod rapport;
 use std::path::{Path, PathBuf};

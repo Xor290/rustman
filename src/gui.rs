@@ -145,6 +145,19 @@ struct RustmanApp {
     auto_gen_pending: Option<(String, std::sync::mpsc::Receiver<Vec<crate::crawler::AttackVariant>>)>,
     // Status message for the last PDF export attempt.
     crawler_pdf_status: Option<String>,
+    // Crawler auth credentials (submitted automatically on login pages).
+    crawler_auth_user: String,
+    crawler_auth_pass: String,
+    crawler_auth_user_field: String,
+    crawler_auth_pass_field: String,
+    crawler_session_cookie: String,
+    crawler_auth_bearer: String,
+    crawler_show_auth: bool,
+    // OpenAPI / Swagger import.
+    crawler_openapi_text: String,
+    crawler_openapi_status: Option<String>,
+    crawler_show_openapi: bool,
+    crawler_openapi_endpoints: Vec<crate::openapi::ApiEndpoint>,
 }
 
 impl RustmanApp {
@@ -203,6 +216,17 @@ impl RustmanApp {
             auto_gen_queue: std::collections::VecDeque::new(),
             auto_gen_pending: None,
             crawler_pdf_status: None,
+            crawler_auth_user: String::new(),
+            crawler_auth_pass: String::new(),
+            crawler_auth_user_field: String::new(),
+            crawler_auth_pass_field: String::new(),
+            crawler_session_cookie: String::new(),
+            crawler_auth_bearer: String::new(),
+            crawler_show_auth: false,
+            crawler_openapi_text: String::new(),
+            crawler_openapi_status: None,
+            crawler_show_openapi: false,
+            crawler_openapi_endpoints: Vec::new(),
         }
     }
 
@@ -332,6 +356,12 @@ impl RustmanApp {
                             request: Vec::new(),
                             response: Vec::new(),
                         });
+                    }
+                }
+                CrawlMsg::LoggedIn { cookie, bearer } => {
+                    self.crawler_session_cookie = cookie;
+                    if let Some(b) = bearer {
+                        self.crawler_auth_bearer = b;
                     }
                 }
                 CrawlMsg::Attack { .. } => {}
@@ -1521,6 +1551,8 @@ impl RustmanApp {
                             self.crawler_attack_responses.clear();
                             self.crawler_attack_pending = None;
                             self.crawler_selected = None;
+                            self.crawler_session_cookie.clear();
+                            self.crawler_auth_bearer.clear();
                             self.crawler_running = true;
 
                             let stop = Arc::new(AtomicBool::new(false));
@@ -1531,8 +1563,20 @@ impl RustmanApp {
 
                             let url   = self.crawler_url.trim().to_string();
                             let depth = self.crawler_max_depth;
+                            let config = crate::crawler::CrawlerConfig {
+                                auth: if !self.crawler_auth_user.is_empty() {
+                                    Some(crate::crawler::CrawlerAuth {
+                                        username: self.crawler_auth_user.clone(),
+                                        password: self.crawler_auth_pass.clone(),
+                                        username_field: self.crawler_auth_user_field.clone(),
+                                        password_field: self.crawler_auth_pass_field.clone(),
+                                    })
+                                } else {
+                                    None
+                                },
+                            };
                             self.rt.spawn(async move {
-                                crate::crawler::run(url, depth, stop, tx).await;
+                                crate::crawler::run(url, depth, stop, tx, config).await;
                             });
                         }
 
@@ -1557,6 +1601,8 @@ impl RustmanApp {
                                 self.auto_gen_queue.clear();
                                 self.auto_gen_pending = None;
                                 self.crawler_pdf_status = None;
+                                self.crawler_session_cookie.clear();
+                                self.crawler_auth_bearer.clear();
                             }
 
                             ui.add_space(4.0);
@@ -1650,6 +1696,164 @@ impl RustmanApp {
                         };
                         ui.colored_label(color, RichText::new(msg).size(10.0));
                     }
+                }
+
+                // ── Auth credentials ──────────────────────────────────────
+                ui.horizontal(|ui| {
+                    let auth_lbl = if self.crawler_show_auth { "▼ Auth" } else { "▶ Auth" };
+                    if ui.small_button(auth_lbl).clicked() {
+                        self.crawler_show_auth = !self.crawler_show_auth;
+                    }
+                    let has_session = !self.crawler_session_cookie.is_empty() || !self.crawler_auth_bearer.is_empty();
+                    if has_session {
+                        let label = if !self.crawler_auth_bearer.is_empty() {
+                            "● JWT"
+                        } else {
+                            "● cookie"
+                        };
+                        ui.colored_label(Color32::from_rgb(80, 200, 100), label);
+                    }
+                });
+                if self.crawler_show_auth {
+                    egui::Grid::new("crawler_auth_grid")
+                        .num_columns(2)
+                        .spacing([4.0, 2.0])
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("User:").size(11.0));
+                            ui.add(
+                                TextEdit::singleline(&mut self.crawler_auth_user)
+                                    .desired_width(130.0)
+                                    .hint_text("username / email"),
+                            );
+                            ui.end_row();
+                            ui.label(RichText::new("Pass:").size(11.0));
+                            ui.add(
+                                TextEdit::singleline(&mut self.crawler_auth_pass)
+                                    .password(true)
+                                    .desired_width(130.0),
+                            );
+                            ui.end_row();
+                            ui.label(RichText::new("User field:").size(11.0));
+                            ui.add(
+                                TextEdit::singleline(&mut self.crawler_auth_user_field)
+                                    .hint_text("auto-detect")
+                                    .desired_width(130.0),
+                            );
+                            ui.end_row();
+                            ui.label(RichText::new("Pass field:").size(11.0));
+                            ui.add(
+                                TextEdit::singleline(&mut self.crawler_auth_pass_field)
+                                    .hint_text("auto-detect")
+                                    .desired_width(130.0),
+                            );
+                            ui.end_row();
+                        });
+                    if !self.crawler_auth_bearer.is_empty() {
+                        let preview = if self.crawler_auth_bearer.len() > 48 {
+                            format!("{}…", &self.crawler_auth_bearer[..48])
+                        } else {
+                            self.crawler_auth_bearer.clone()
+                        };
+                        ui.label(
+                            RichText::new(format!("Bearer: {preview}"))
+                                .size(10.0)
+                                .monospace()
+                                .color(Color32::from_rgb(100, 200, 120)),
+                        );
+                    } else if !self.crawler_session_cookie.is_empty() {
+                        let preview = if self.crawler_session_cookie.len() > 50 {
+                            format!("{}…", &self.crawler_session_cookie[..50])
+                        } else {
+                            self.crawler_session_cookie.clone()
+                        };
+                        ui.label(
+                            RichText::new(format!("Cookie: {preview}"))
+                                .size(10.0)
+                                .monospace()
+                                .color(Color32::from_rgb(100, 200, 120)),
+                        );
+                    }
+                }
+
+                // ── OpenAPI / Swagger import ───────────────────────────────
+                ui.horizontal(|ui| {
+                    let api_lbl = if self.crawler_show_openapi { "▼ OpenAPI" } else { "▶ OpenAPI" };
+                    if ui.small_button(api_lbl).clicked() {
+                        self.crawler_show_openapi = !self.crawler_show_openapi;
+                    }
+                    if !self.crawler_openapi_endpoints.is_empty() {
+                        ui.colored_label(
+                            Color32::from_rgb(100, 160, 255),
+                            format!("{} endpoint(s)", self.crawler_openapi_endpoints.len()),
+                        );
+                    }
+                });
+                if self.crawler_show_openapi {
+                    ui.add(
+                        TextEdit::multiline(&mut self.crawler_openapi_text)
+                            .hint_text("Paste OpenAPI 3.x / Swagger 2.x JSON here…")
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(4)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("Parse").clicked() && !self.crawler_openapi_text.trim().is_empty() {
+                            match crate::openapi::parse(&self.crawler_openapi_text) {
+                                Ok(eps) => {
+                                    let n = eps.len();
+                                    self.crawler_openapi_endpoints = eps;
+                                    self.crawler_openapi_status = Some(format!("✓ {n} endpoint(s) parsed"));
+                                }
+                                Err(e) => {
+                                    self.crawler_openapi_endpoints.clear();
+                                    self.crawler_openapi_status = Some(format!("✗ {e}"));
+                                }
+                            }
+                        }
+                        if !self.crawler_openapi_endpoints.is_empty() {
+                            let atk_btn = egui::Button::new(
+                                RichText::new("▶ Attack All").size(11.0).color(Color32::WHITE),
+                            )
+                            .fill(Color32::from_rgb(60, 100, 180));
+                            if ui.add(atk_btn).clicked() {
+                                let base_url = self.crawler_url.trim().to_string();
+                                if let Some(parts) = crate::crawler::parse_url(&base_url) {
+                                    let cookie_hdr = self.crawler_session_cookie.clone();
+                                    let tls  = parts.tls;
+                                    let port = parts.port;
+                                    let host = parts.host.clone();
+                                    let proto = if tls { "https" } else { "http" };
+                                    let port_sfx = match (tls, port) {
+                                        (true, 443) | (false, 80) => String::new(),
+                                        _ => format!(":{port}"),
+                                    };
+                                    for ep in &self.crawler_openapi_endpoints {
+                                        let raw = ep.build_request(&host, port, tls, &cookie_hdr, &self.crawler_auth_bearer);
+                                        let mut clean_path = ep.path.clone();
+                                        loop {
+                                            if let (Some(a), Some(b)) = (clean_path.find('{'), clean_path.find('}')) {
+                                                if b > a {
+                                                    clean_path = format!("{}test{}", &clean_path[..a], &clean_path[b + 1..]);
+                                                    continue;
+                                                }
+                                            }
+                                            break;
+                                        }
+                                        let url = format!("{proto}://{host}{port_sfx}{clean_path}");
+                                        self.auto_gen_queue.push_back((url, raw));
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(ref st) = self.crawler_openapi_status.clone() {
+                            let color = if st.starts_with('✓') {
+                                Color32::from_rgb(80, 200, 100)
+                            } else {
+                                Color32::from_rgb(220, 80, 80)
+                            };
+                            ui.colored_label(color, RichText::new(st).size(11.0));
+                        }
+                    });
                 }
 
                 ui.separator();

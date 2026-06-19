@@ -4,6 +4,21 @@ use std::sync::Arc;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
+#[derive(Clone, Default)]
+pub struct CrawlerAuth {
+    pub username: String,
+    pub password: String,
+    /// Name of the username form field. Empty = auto-detect.
+    pub username_field: String,
+    /// Name of the password form field. Empty = auto-detect.
+    pub password_field: String,
+}
+
+#[derive(Clone, Default)]
+pub struct CrawlerConfig {
+    pub auth: Option<CrawlerAuth>,
+}
+
 pub enum CrawlMsg {
     Visiting {
         url: String,
@@ -19,6 +34,11 @@ pub enum CrawlMsg {
     Failed {
         url: String,
         reason: String,
+    },
+    /// Sent once after the crawler successfully logs in or registers and acquires credentials.
+    LoggedIn {
+        cookie: String,
+        bearer: Option<String>,
     },
     Finished,
     Attack {
@@ -66,6 +86,7 @@ pub async fn run(
     max_depth: usize,
     stop: Arc<AtomicBool>,
     tx: std::sync::mpsc::SyncSender<CrawlMsg>,
+    config: CrawlerConfig,
 ) {
     let base = match parse_url_parts(&start_url) {
         Some(b) => b,
@@ -83,8 +104,18 @@ pub async fn run(
     let mut visited: HashSet<String>         = HashSet::new();
     let mut visited_js: HashSet<String>      = HashSet::new();
     let mut queue: VecDeque<(String, usize)> = VecDeque::new();
-    // JS files queued for API route extraction: (url, depth-of-parent-page)
     let mut js_queue: VecDeque<(String, usize)> = VecDeque::new();
+    let mut session_cookies: Vec<(String, String)> = Vec::new();
+    let mut auth_bearer: Option<String> = None;
+    let mut logged_in = false;
+    let mut registered = false;
+    let mut retry_after_auth: Vec<(String, usize)> = Vec::new();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let reg_email = format!("rustman_{ts}@test.local");
+    let reg_password = "Rustman@Test123!".to_string();
 
     visited.insert(canonical(&start_url));
     queue.push_back((start_url, 0));
@@ -103,9 +134,8 @@ pub async fn run(
                 continue;
             }
             let Some((jh, jp, jt, jpath)) = parse_url_parts(&js_url) else { continue };
-            let js_req = format!(
-                "GET {jpath} HTTP/1.1\r\nHost: {jh}\r\nUser-Agent: rustman-crawler/1.0\r\nAccept: */*\r\nConnection: close\r\n\r\n"
-            ).into_bytes();
+            let cookie_hdr = make_cookie_header(&session_cookies);
+            let js_req = build_get_request(&jpath, &jh, &cookie_hdr, auth_bearer.as_deref(), "*/*").into_bytes();
             let js_resp = crate::proxy::repeater_send(&jh, jp, jt, js_req).await;
             let (js_st, js_body) = split_response(&js_resp);
             if js_st == 200 {
@@ -135,9 +165,10 @@ pub async fn run(
             }
         };
 
-        let request_bytes = format!(
-            "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: rustman-crawler/1.0\r\nAccept: text/html,*/*;q=0.9\r\nAccept-Language: en\r\nConnection: close\r\n\r\n"
-        ).into_bytes();
+        let cookie_hdr = make_cookie_header(&session_cookies);
+        let has_auth = !session_cookies.is_empty() || auth_bearer.is_some();
+        let request_str = build_get_request(&path, &host, &cookie_hdr, auth_bearer.as_deref(), "text/html,*/*;q=0.9");
+        let request_bytes = request_str.into_bytes();
 
         let _ = tx.send(CrawlMsg::Visiting {
             url: url.clone(),
@@ -148,8 +179,87 @@ pub async fn run(
         let resp = crate::proxy::repeater_send(&host, port, tls, request_bytes).await;
         let (status, body) = split_response(&resp);
 
+        // 401 with no auth yet → queue URL for retry once credentials are acquired.
+        if status == 401 && !has_auth {
+            retry_after_auth.push((url.clone(), depth));
+        }
+
+        // ── Auto-login: detect login form and submit credentials once ─────────
+        if !logged_in {
+            if let Some(ref auth) = config.auth {
+                if !auth.username.is_empty() {
+                    if let Some(form) = detect_login_form(&body, &path, auth) {
+                        logged_in = true; // attempt only once regardless of outcome
+                        let mut fields: Vec<(String, String)> = vec![
+                            (form.username_field.clone(), auth.username.clone()),
+                            (form.password_field.clone(), auth.password.clone()),
+                        ];
+                        fields.extend(form.hidden_fields.iter().cloned());
+                        let form_body: String = fields.iter()
+                            .map(|(k, v)| format!("{}={}", url_encode_form(k), url_encode_form(v)))
+                            .collect::<Vec<_>>()
+                            .join("&");
+                        let form_body_len = form_body.len();
+                        if let Some((lh, lp, lt, lpath)) =
+                            resolve_form_action(&form.action, &base_host, base_tls, base_port, &path)
+                        {
+                            let method_uc = form.method.to_uppercase();
+                            let cookie_line = if cookie_hdr.is_empty() {
+                                String::new()
+                            } else {
+                                format!("Cookie: {cookie_hdr}\r\n")
+                            };
+                            let login_req = format!(
+                                "{method_uc} {lpath} HTTP/1.1\r\nHost: {lh}\r\nUser-Agent: rustman-crawler/1.0\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {form_body_len}\r\n{cookie_line}Connection: close\r\n\r\n{form_body}"
+                            ).into_bytes();
+                            let login_resp = crate::proxy::repeater_send(&lh, lp, lt, login_req).await;
+                            let new_cookies = extract_set_cookies(&login_resp);
+                            if !new_cookies.is_empty() {
+                                for (k, v) in new_cookies {
+                                    if let Some(e) = session_cookies.iter_mut().find(|(n, _)| n == &k) {
+                                        e.1 = v;
+                                    } else {
+                                        session_cookies.push((k, v));
+                                    }
+                                }
+                                let cookie_str = make_cookie_header(&session_cookies);
+                                let _ = tx.send(CrawlMsg::LoggedIn { cookie: cookie_str, bearer: None });
+                                for item in retry_after_auth.drain(..) {
+                                    queue.push_front(item);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Auto-register: JSON registration when URL matches a signup pattern ──
+        if !registered && is_registration_url(&url) {
+            if try_json_register(&host, port, tls, &path, &reg_email, &reg_password).await {
+                registered = true;
+                if let Some((new_cookies, bearer)) =
+                    try_json_login(&host, port, tls, &reg_email, &reg_password).await
+                {
+                    for (k, v) in new_cookies {
+                        if let Some(e) = session_cookies.iter_mut().find(|(n, _)| n == &k) {
+                            e.1 = v;
+                        } else {
+                            session_cookies.push((k, v));
+                        }
+                    }
+                    auth_bearer = bearer.clone();
+                    let cookie_str = make_cookie_header(&session_cookies);
+                    let _ = tx.send(CrawlMsg::LoggedIn { cookie: cookie_str, bearer });
+                    // Re-queue all URLs that failed with 401 — now we have credentials.
+                    for item in retry_after_auth.drain(..) {
+                        queue.push_front(item);
+                    }
+                }
+            }
+        }
+
         let new_links = if depth < max_depth && status == 200 {
-            // HTML links
             let links = extract_links(&body, &base_host, base_tls, base_port, &path);
             let mut count = 0;
             for link in links {
@@ -161,7 +271,6 @@ pub async fn run(
                 }
             }
 
-            // External JS files (<script src="...">)
             let scripts = extract_script_srcs(&body, &base_host, base_tls, base_port, &path);
             for js_url in scripts {
                 let key = canonical(&js_url);
@@ -171,7 +280,6 @@ pub async fn run(
                 }
             }
 
-            // Inline JS (<script> without src)
             let inline = extract_inline_js(&body);
             if !inline.is_empty() {
                 enqueue_js_routes(
@@ -200,6 +308,201 @@ pub async fn run(
     }
 
     let _ = tx.send(CrawlMsg::Finished);
+}
+
+// ── Request / session helpers ─────────────────────────────────────────────────
+
+fn build_get_request(path: &str, host: &str, cookie_hdr: &str, bearer: Option<&str>, accept: &str) -> String {
+    let cookie_line = if cookie_hdr.is_empty() {
+        String::new()
+    } else {
+        format!("Cookie: {cookie_hdr}\r\n")
+    };
+    let auth_line = match bearer {
+        Some(t) if !t.is_empty() => format!("Authorization: Bearer {t}\r\n"),
+        _ => String::new(),
+    };
+    format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: rustman-crawler/1.0\r\nAccept: {accept}\r\nAccept-Language: en\r\n{cookie_line}{auth_line}Connection: close\r\n\r\n"
+    )
+}
+
+fn make_cookie_header(cookies: &[(String, String)]) -> String {
+    cookies.iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn extract_set_cookies(resp: &[u8]) -> Vec<(String, String)> {
+    let text = String::from_utf8_lossy(resp);
+    let headers = text.split("\r\n\r\n").next().unwrap_or("");
+    let mut cookies = Vec::new();
+    for line in headers.lines() {
+        if line.len() < 12 { continue; }
+        if !line[..11].eq_ignore_ascii_case("set-cookie:") { continue; }
+        let val = line[11..].trim();
+        if let Some(part) = val.split(';').next() {
+            if let Some(eq) = part.find('=') {
+                let name = part[..eq].trim().to_string();
+                let value = part[eq + 1..].trim().to_string();
+                if !name.is_empty() {
+                    cookies.push((name, value));
+                }
+            }
+        }
+    }
+    cookies
+}
+
+fn extract_attr_value(tag: &str, attr: &str) -> Option<String> {
+    let lc = tag.to_ascii_lowercase();
+    let search = format!("{attr}=");
+    let pos = lc.find(&search)?;
+    let after = &tag[pos + search.len()..];
+    if after.is_empty() { return None; }
+    match after.as_bytes()[0] {
+        b'"' => {
+            let end = after[1..].find('"')?;
+            Some(after[1..end + 1].to_string())
+        }
+        b'\'' => {
+            let end = after[1..].find('\'')?;
+            Some(after[1..end + 1].to_string())
+        }
+        _ => {
+            let end = after.find(|c: char| c.is_whitespace() || c == '>').unwrap_or(after.len());
+            Some(after[..end].to_string())
+        }
+    }
+}
+
+struct LoginForm {
+    action: String,
+    method: String,
+    username_field: String,
+    password_field: String,
+    hidden_fields: Vec<(String, String)>,
+}
+
+fn detect_login_form(html: &str, current_path: &str, auth: &CrawlerAuth) -> Option<LoginForm> {
+    let lc = html.to_ascii_lowercase();
+    if !lc.contains("type=\"password\"") && !lc.contains("type='password'") {
+        return None;
+    }
+    let pass_pos = lc.find("type=\"password\"").or_else(|| lc.find("type='password'"))?;
+    // Find the nearest <form before the password field
+    let form_start = lc[..pass_pos].rfind("<form")?;
+    let form_tag_end = form_start + lc[form_start..].find('>')?;
+    let form_tag = &html[form_start..form_tag_end + 1];
+    let action = extract_attr_value(form_tag, "action")
+        .unwrap_or_else(|| current_path.to_string());
+    let method = extract_attr_value(form_tag, "method")
+        .unwrap_or_else(|| "post".to_string())
+        .to_ascii_lowercase();
+
+    let form_body_start = form_tag_end + 1;
+    let form_end = lc[form_body_start..]
+        .find("</form>")
+        .map(|p| form_body_start + p)
+        .unwrap_or(html.len());
+    let form_body = &html[form_body_start..form_end];
+    let form_body_lc = form_body.to_ascii_lowercase();
+
+    let mut username_field = if !auth.username_field.is_empty() {
+        auth.username_field.clone()
+    } else {
+        String::new()
+    };
+    let mut password_field = if !auth.password_field.is_empty() {
+        auth.password_field.clone()
+    } else {
+        String::new()
+    };
+    let mut hidden_fields: Vec<(String, String)> = Vec::new();
+
+    let mut ipos = 0;
+    while let Some(rel) = form_body_lc[ipos..].find("<input") {
+        let abs = ipos + rel;
+        let tag_end = form_body_lc[abs..]
+            .find('>')
+            .map(|e| abs + e + 1)
+            .unwrap_or(form_body.len());
+        let tag_end = tag_end.min(form_body.len());
+        let input_tag = &form_body[abs..tag_end];
+        let itype = extract_attr_value(input_tag, "type")
+            .unwrap_or_else(|| "text".to_string())
+            .to_ascii_lowercase();
+        let iname = extract_attr_value(input_tag, "name").unwrap_or_default();
+        let ivalue = extract_attr_value(input_tag, "value").unwrap_or_default();
+        let iname_lc = iname.to_ascii_lowercase();
+
+        if itype == "password" && password_field.is_empty() {
+            password_field = iname;
+        } else if itype == "hidden" && !iname.is_empty() {
+            hidden_fields.push((iname, ivalue));
+        } else if username_field.is_empty()
+            && !iname.is_empty()
+            && iname_lc != "search"
+            && iname_lc != "q"
+            && (iname_lc.contains("user")
+                || iname_lc.contains("email")
+                || iname_lc.contains("login")
+                || iname_lc.contains("mail")
+                || iname_lc.contains("account")
+                || iname_lc.contains("pseudo")
+                || iname_lc.contains("identif")
+                || itype == "email"
+                || (username_field.is_empty() && (itype == "text" || itype.is_empty())))
+        {
+            username_field = iname;
+        }
+
+        ipos = tag_end;
+        if ipos == 0 { break; }
+    }
+
+    if password_field.is_empty() || username_field.is_empty() {
+        return None;
+    }
+    Some(LoginForm { action, method, username_field, password_field, hidden_fields })
+}
+
+fn url_encode_form(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
+            | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn resolve_form_action(
+    action: &str,
+    base_host: &str,
+    base_tls: bool,
+    base_port: u16,
+    current_path: &str,
+) -> Option<(String, u16, bool, String)> {
+    let proto = if base_tls { "https" } else { "http" };
+    let port_sfx = match (base_tls, base_port) {
+        (true, 443) | (false, 80) => String::new(),
+        _ => format!(":{base_port}"),
+    };
+    if action.starts_with("http://") || action.starts_with("https://") {
+        parse_url_parts(action)
+    } else if action.starts_with('/') {
+        parse_url_parts(&format!("{proto}://{base_host}{port_sfx}{action}"))
+    } else if action.is_empty() {
+        parse_url_parts(&format!("{proto}://{base_host}{port_sfx}{current_path}"))
+    } else {
+        let dir = current_path.rfind('/').map(|i| &current_path[..i + 1]).unwrap_or("/");
+        parse_url_parts(&format!("{proto}://{base_host}{port_sfx}{dir}{action}"))
+    }
 }
 
 // ── URL helpers ───────────────────────────────────────────────────────────────
@@ -854,25 +1157,20 @@ pub fn attack(link: &str) -> Vec<AttackVariant> {
 }
 
 /// Inject payloads into every URL query parameter.
-/// If the URL has no query string, a synthetic `id=` parameter is added.
+/// If the URL has no query string, nothing is tested.
 fn attack_url_params(url: &str, raw: &[u8]) -> Vec<AttackVariant> {
     let (base, query_opt) = match url.split_once('?') {
         Some((b, q)) => (b, Some(q)),
         None         => (url, None),
     };
 
-    let owned;
     let pairs: Vec<(&str, &str)> = match query_opt {
         Some(q) => {
             let p = parse_kv(q);
             if p.is_empty() { return vec![]; }
             p
         }
-        None => {
-            // No query string: synthesize a common injectable param.
-            owned = vec![("id", "1")];
-            owned.iter().map(|(k, v)| (*k, *v)).collect()
-        }
+        None => return vec![],
     };
 
     let payloads = get_payloads();
@@ -1113,4 +1411,144 @@ fn url_encode(s: &str) -> String {
         }
     }
     out
+}
+
+// ── Auto-registration helpers ─────────────────────────────────────────────────
+
+fn is_registration_url(url: &str) -> bool {
+    let path = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
+    // Strip trailing slash for matching
+    let path = path.trim_end_matches('/');
+    const PATTERNS: &[&str] = &[
+        "/register",
+        "/signup",
+        "/sign-up",
+        "/create-account",
+        "/join",
+        "/api/users",
+        "/api/user",
+        "/users/create",
+        "/auth/register",
+        "/auth/signup",
+        "/accounts/register",
+        "/account/create",
+        "/api/register",
+        "/api/signup",
+        "/api/v1/users",
+        "/api/v2/users",
+    ];
+    PATTERNS.iter().any(|p| path.ends_with(p))
+}
+
+async fn try_json_register(
+    host: &str,
+    port: u16,
+    tls: bool,
+    path: &str,
+    email: &str,
+    password: &str,
+) -> bool {
+    let bodies = [
+        format!(r#"{{"email":"{email}","password":"{password}","passwordRepeat":"{password}"}}"#),
+        format!(r#"{{"username":"{email}","email":"{email}","password":"{password}","confirmPassword":"{password}"}}"#),
+        format!(r#"{{"email":"{email}","password":"{password}","password_confirmation":"{password}"}}"#),
+        format!(r#"{{"email":"{email}","password":"{password}"}}"#),
+    ];
+    for body in &bodies {
+        let body_len = body.len();
+        let req = format!(
+            "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {body_len}\r\nAccept: application/json\r\nConnection: close\r\n\r\n{body}"
+        )
+        .into_bytes();
+        let resp = crate::proxy::repeater_send(host, port, tls, req).await;
+        let (status, _) = split_response(&resp);
+        if status == 200 || status == 201 {
+            return true;
+        }
+    }
+    false
+}
+
+async fn try_json_login(
+    host: &str,
+    port: u16,
+    tls: bool,
+    email: &str,
+    password: &str,
+) -> Option<(Vec<(String, String)>, Option<String>)> {
+    const LOGIN_PATHS: &[&str] = &[
+        "/rest/user/login",
+        "/api/login",
+        "/api/auth/login",
+        "/api/auth/token",
+        "/auth/login",
+        "/auth/token",
+        "/login",
+        "/api/users/login",
+        "/api/user/login",
+        "/api/sessions",
+        "/api/token",
+        "/oauth/token",
+    ];
+    let bodies = [
+        format!(r#"{{"email":"{email}","password":"{password}"}}"#),
+        format!(r#"{{"username":"{email}","password":"{password}"}}"#),
+    ];
+    for path in LOGIN_PATHS {
+        for body in &bodies {
+            let body_len = body.len();
+            let req = format!(
+                "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {body_len}\r\nAccept: application/json\r\nConnection: close\r\n\r\n{body}"
+            )
+            .into_bytes();
+            let resp = crate::proxy::repeater_send(host, port, tls, req).await;
+            let (status, body_str) = split_response(&resp);
+            if status == 200 {
+                let cookies = extract_set_cookies(&resp);
+                let bearer = extract_bearer_from_json(&body_str);
+                if bearer.is_some() || !cookies.is_empty() {
+                    return Some((cookies, bearer));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_bearer_from_json(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    // Ordered list of JSON paths to check — most specific first.
+    const PATHS: &[&[&str]] = &[
+        &["authentication", "token"],
+        &["data", "accessToken"],
+        &["data", "token"],
+        &["result", "token"],
+        &["user", "token"],
+        &["access_token"],
+        &["accessToken"],
+        &["token"],
+        &["jwt"],
+        &["auth_token"],
+        &["authToken"],
+        &["id_token"],
+        &["idToken"],
+    ];
+    for path in PATHS {
+        let mut cur = &v;
+        let mut ok = true;
+        for &key in *path {
+            match cur.get(key) {
+                Some(next) => cur = next,
+                None => { ok = false; break; }
+            }
+        }
+        if ok {
+            if let Some(t) = cur.as_str() {
+                if !t.is_empty() {
+                    return Some(t.to_string());
+                }
+            }
+        }
+    }
+    None
 }
