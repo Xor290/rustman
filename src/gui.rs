@@ -4,14 +4,14 @@ use std::sync::Arc;
 
 fn load_window_icon() -> std::sync::Arc<egui::IconData> {
     let bytes = include_bytes!("../logo.png");
-    let img   = image::load_from_memory(bytes)
+    let img = image::load_from_memory(bytes)
         .expect("logo.png embedded")
         .resize_exact(256, 256, image::imageops::FilterType::Lanczos3)
         .to_rgba8();
     let (w, h) = img.dimensions();
     std::sync::Arc::new(egui::IconData {
-        rgba:   img.into_raw(),
-        width:  w,
+        rgba: img.into_raw(),
+        width: w,
         height: h,
     })
 }
@@ -129,6 +129,22 @@ struct RustmanApp {
     exploit_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     exploit_thinking: bool,
     exploit_code: String,
+    // Confirmed findings for the UI badge / VULN indicator.
+    crawler_findings: Vec<crate::rapport::Finding>,
+    // Full log of every attack attempt (all payloads, all status codes) for PDF.
+    crawler_all_records: Vec<crate::rapport::AttackRecord>,
+    // Per-URL parallel attack queues: one in-flight request per URL, all run concurrently.
+    per_url_pending: std::collections::HashMap<String, (crate::crawler::AttackVariant, std::sync::mpsc::Receiver<Vec<u8>>)>,
+    per_url_queue:   std::collections::HashMap<String, std::collections::VecDeque<crate::crawler::AttackVariant>>,
+    // Global status-code map: (url, category, payload) → HTTP code for instant UI display.
+    attack_status_map: std::collections::HashMap<(String, String, String), u16>,
+    auto_attacks_sent:  usize,
+    auto_attacks_total: usize,
+    // Auto-generation pipeline: one URL at a time feeding into per_url_queue.
+    auto_gen_queue:   std::collections::VecDeque<(String, Vec<u8>)>,
+    auto_gen_pending: Option<(String, std::sync::mpsc::Receiver<Vec<crate::crawler::AttackVariant>>)>,
+    // Status message for the last PDF export attempt.
+    crawler_pdf_status: Option<String>,
 }
 
 impl RustmanApp {
@@ -177,6 +193,16 @@ impl RustmanApp {
             exploit_rx: None,
             exploit_thinking: false,
             exploit_code: String::new(),
+            crawler_findings: Vec::new(),
+            crawler_all_records: Vec::new(),
+            per_url_pending: std::collections::HashMap::new(),
+            per_url_queue: std::collections::HashMap::new(),
+            attack_status_map: std::collections::HashMap::new(),
+            auto_attacks_sent: 0,
+            auto_attacks_total: 0,
+            auto_gen_queue: std::collections::VecDeque::new(),
+            auto_gen_pending: None,
+            crawler_pdf_status: None,
         }
     }
 
@@ -240,18 +266,27 @@ impl RustmanApp {
 
     fn poll_crawler(&mut self, _ctx: &egui::Context) -> bool {
         use crate::crawler::{CrawlMsg, EntryStatus};
-        if self.crawler_rx.is_none() { return false; }
+        if self.crawler_rx.is_none() {
+            return false;
+        }
 
         let mut changed = false;
         // Cap at 32 messages per frame to keep the UI responsive.
         for _ in 0..32 {
             let msg = match &self.crawler_rx {
-                Some(rx) => match rx.try_recv() { Ok(m) => m, Err(_) => break },
+                Some(rx) => match rx.try_recv() {
+                    Ok(m) => m,
+                    Err(_) => break,
+                },
                 None => break,
             };
             changed = true;
             match msg {
-                CrawlMsg::Visiting { url, depth, request } => {
+                CrawlMsg::Visiting {
+                    url,
+                    depth,
+                    request,
+                } => {
                     let idx = self.crawler_entries.len();
                     self.crawler_entry_index.insert(url.clone(), idx);
                     self.crawler_entries.push(crate::crawler::CrawlerEntry {
@@ -262,13 +297,22 @@ impl RustmanApp {
                         response: Vec::new(),
                     });
                 }
-                CrawlMsg::Done { url, status, new_links, response } => {
+                CrawlMsg::Done {
+                    url,
+                    status,
+                    new_links,
+                    response,
+                } => {
                     if let Some(&i) = self.crawler_entry_index.get(&url) {
                         if let Some(e) = self.crawler_entries.get_mut(i) {
-                            e.status   = EntryStatus::Done(status, new_links);
+                            e.status = EntryStatus::Done(status, new_links);
                             e.response = response;
                             if self.crawler_selected == Some(i) {
                                 self.crawler_attacks_for = None;
+                            }
+                            // Auto-attack: queue this URL for attack generation.
+                            if !e.request.is_empty() {
+                                self.auto_gen_queue.push_back((e.url.clone(), e.request.clone()));
                             }
                         }
                     }
@@ -303,7 +347,10 @@ impl RustmanApp {
 
     fn poll_attacks_gen(&mut self) -> bool {
         let variants = match &self.crawler_attacks_gen_rx {
-            Some(rx) => match rx.try_recv() { Ok(v) => v, Err(_) => return false },
+            Some(rx) => match rx.try_recv() {
+                Ok(v) => v,
+                Err(_) => return false,
+            },
             None => return false,
         };
         self.crawler_attacks = variants;
@@ -318,10 +365,14 @@ impl RustmanApp {
                     Ok(t) => t,
                     Err(e) => format!("Error: {e}"),
                 };
-                self.state.lock().unwrap().chat_messages.push(crate::app::ChatMessage {
-                    from_user: false,
-                    text,
-                });
+                self.state
+                    .lock()
+                    .unwrap()
+                    .chat_messages
+                    .push(crate::app::ChatMessage {
+                        from_user: false,
+                        text,
+                    });
                 self.claude_thinking = false;
                 self.claude_rx = None;
                 return true;
@@ -333,14 +384,194 @@ impl RustmanApp {
     fn poll_attack(&mut self) -> bool {
         let (idx, bytes) = match &self.crawler_attack_pending {
             Some((i, rx)) => match rx.try_recv() {
-                Ok(b)  => (*i, b),
+                Ok(b) => (*i, b),
                 Err(_) => return false,
             },
             None => return false,
         };
+
+        // Check whether the payload was reflected / triggered.
+        if let Some(atk) = self.crawler_attacks.get(idx) {
+            let status_code: u16 = std::str::from_utf8(&bytes)
+                .unwrap_or("")
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+
+            let evidence = {
+                let ev = crate::rapport::check_reflected(&atk.category, &atk.payload, &bytes);
+                if crate::rapport::is_false_positive(&atk.category, status_code) { None } else { ev }
+            };
+
+            if let Some(ref ev) = evidence {
+                self.crawler_findings.push(crate::rapport::Finding {
+                    url: atk.url.clone(),
+                    category: atk.category.clone(),
+                    target: format!("{}", atk.target),
+                    payload: atk.payload.clone(),
+                    evidence: ev.clone(),
+                });
+            }
+
+            self.attack_status_map.insert(
+                (atk.url.clone(), atk.category.clone(), atk.payload.clone()),
+                status_code,
+            );
+            self.crawler_all_records.push(crate::rapport::AttackRecord {
+                url: atk.url.clone(),
+                category: atk.category.clone(),
+                target: format!("{}", atk.target),
+                payload: atk.payload.clone(),
+                status_code,
+                evidence,
+                raw_request: String::from_utf8_lossy(&atk.raw_request).into_owned(),
+            });
+        }
+
         self.crawler_attack_responses.insert(idx, bytes);
         self.crawler_attack_pending = None;
         true
+    }
+
+    /// Fire one attack for a specific URL key, storing the receiver in per_url_pending.
+    fn fire_url_attack(&mut self, url: String, atk: crate::crawler::AttackVariant) {
+        let Some(parts) = crate::crawler::parse_url(&atk.url) else { return };
+        let raw  = atk.raw_request.clone();
+        let host = parts.host;
+        let port = parts.port;
+        let tls  = parts.tls;
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.per_url_pending.insert(url, (atk, rx));
+        self.rt.spawn(async move {
+            let resp = crate::proxy::repeater_send(&host, port, tls, raw).await;
+            let _ = tx.send(resp);
+        });
+    }
+
+    /// Poll all per-URL in-flight attacks in parallel; process completions and fire next.
+    fn poll_auto_attack(&mut self) -> bool {
+        // Collect completions without holding a borrow on self.
+        let completed: Vec<(String, crate::crawler::AttackVariant, Vec<u8>)> = self
+            .per_url_pending
+            .iter()
+            .filter_map(|(url, (atk, rx))| {
+                rx.try_recv().ok().map(|bytes| (url.clone(), atk.clone(), bytes))
+            })
+            .collect();
+
+        if completed.is_empty() {
+            return false;
+        }
+
+        let mut to_fire: Vec<(String, crate::crawler::AttackVariant)> = Vec::new();
+
+        for (url, atk, bytes) in completed {
+            self.per_url_pending.remove(&url);
+
+            let status_code: u16 = std::str::from_utf8(&bytes)
+                .unwrap_or("")
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+
+            let evidence = {
+                let ev = crate::rapport::check_reflected(&atk.category, &atk.payload, &bytes);
+                if crate::rapport::is_false_positive(&atk.category, status_code) { None } else { ev }
+            };
+
+            if let Some(ref ev) = evidence {
+                self.crawler_findings.push(crate::rapport::Finding {
+                    url:      atk.url.clone(),
+                    category: atk.category.clone(),
+                    target:   format!("{}", atk.target),
+                    payload:  atk.payload.clone(),
+                    evidence: ev.clone(),
+                });
+            }
+
+            self.attack_status_map.insert(
+                (atk.url.clone(), atk.category.clone(), atk.payload.clone()),
+                status_code,
+            );
+            self.crawler_all_records.push(crate::rapport::AttackRecord {
+                url:         atk.url.clone(),
+                category:    atk.category.clone(),
+                target:      format!("{}", atk.target),
+                payload:     atk.payload.clone(),
+                status_code,
+                evidence,
+                raw_request: String::from_utf8_lossy(&atk.raw_request).into_owned(),
+            });
+            self.auto_attacks_sent += 1;
+
+            // Queue next attack for this URL.
+            let next = self.per_url_queue.get_mut(&url).and_then(|q| q.pop_front());
+            if let Some(next_atk) = next {
+                to_fire.push((url, next_atk));
+            }
+        }
+
+        for (url, atk) in to_fire {
+            self.fire_url_attack(url, atk);
+        }
+        true
+    }
+
+    /// Process the attack-generation pipeline: one URL at a time, each URL's
+    /// variants feed into its own per_url_queue and attack in parallel with others.
+    fn poll_auto_gen(&mut self) -> bool {
+        // Check if the in-flight generation finished (borrow ends before mutation).
+        let gen_result: Option<(String, Vec<crate::crawler::AttackVariant>)> = {
+            match &self.auto_gen_pending {
+                Some((url, rx)) => rx.try_recv().ok().map(|v| (url.clone(), v)),
+                None => None,
+            }
+        };
+
+        if let Some((gen_url, variants)) = gen_result {
+            self.auto_gen_pending = None;
+            self.auto_attacks_total += variants.len();
+            {
+                let queue = self.per_url_queue
+                    .entry(gen_url.clone())
+                    .or_insert_with(std::collections::VecDeque::new);
+                queue.extend(variants);
+            }
+            // Fire first attack for this URL if not already in-flight.
+            if !self.per_url_pending.contains_key(&gen_url) {
+                let first = self.per_url_queue.get_mut(&gen_url).and_then(|q| q.pop_front());
+                if let Some(atk) = first {
+                    self.fire_url_attack(gen_url, atk);
+                }
+            }
+            // Start generating the next URL immediately.
+            if let Some((url, raw)) = self.auto_gen_queue.pop_front() {
+                self.spawn_gen(url, raw);
+            }
+            return true;
+        }
+
+        // No result ready. If idle, start the next URL.
+        if self.auto_gen_pending.is_none() {
+            if let Some((url, raw)) = self.auto_gen_queue.pop_front() {
+                self.spawn_gen(url, raw);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn spawn_gen(&mut self, url: String, raw: Vec<u8>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.auto_gen_pending = Some((url.clone(), rx));
+        std::thread::spawn(move || {
+            let variants = crate::crawler::attack_request(&url, &raw);
+            let _ = tx.send(variants);
+        });
     }
 
     fn poll_exploit(&mut self) -> bool {
@@ -350,7 +581,10 @@ impl RustmanApp {
                     Ok(t) => t,
                     Err(e) => format!("Error: {e}"),
                 };
-                self.exploit_messages.push(ExploitMessage { from_user: false, text });
+                self.exploit_messages.push(ExploitMessage {
+                    from_user: false,
+                    text,
+                });
                 self.exploit_thinking = false;
                 self.exploit_rx = None;
                 return true;
@@ -396,17 +630,22 @@ impl eframe::App for RustmanApp {
         // Adaptive repaint: fast when something is in-flight (spinner), slow when idle.
         let has_inflight = self.crawler_running
             || self.crawler_attack_pending.is_some()
+            || !self.per_url_pending.is_empty()
+            || self.auto_gen_pending.is_some()
+            || !self.auto_gen_queue.is_empty()
             || self.crawler_attacks_gen_rx.is_some()
             || self.claude_thinking
             || self.exploit_thinking;
-        ctx.request_repaint_after(std::time::Duration::from_millis(
-            if has_inflight { 80 } else { 500 },
-        ));
+        ctx.request_repaint_after(std::time::Duration::from_millis(if has_inflight {
+            80
+        } else {
+            500
+        }));
 
         // Single mutex lock per frame for all cached values.
         {
             let s = self.state.lock().unwrap();
-            let light   = s.settings.light_mode;
+            let light = s.settings.light_mode;
             let pending = s.pending_prompt.is_some();
             if light != self.cached_light_mode {
                 self.cached_light_mode = light;
@@ -424,6 +663,8 @@ impl eframe::App for RustmanApp {
             | self.poll_crawler(ctx)
             | self.poll_claude()
             | self.poll_attack()
+            | self.poll_auto_attack()
+            | self.poll_auto_gen()
             | self.poll_attacks_gen()
             | self.poll_exploit();
         if repaint {
@@ -473,7 +714,7 @@ impl RustmanApp {
                     // Logo — loaded once, displayed at 32×32 px.
                     let tex = self.logo_texture.get_or_insert_with(|| {
                         let bytes = include_bytes!("../logo.png");
-                        let img   = image::load_from_memory(bytes)
+                        let img = image::load_from_memory(bytes)
                             .expect("logo.png embedded")
                             .resize(64, 64, image::imageops::FilterType::Lanczos3)
                             .to_rgba8();
@@ -502,12 +743,18 @@ impl RustmanApp {
 
                     // Tab buttons — active = orange, inactive = gray
                     let tab_color = |active: bool| -> Color32 {
-                        if active { Color32::from_rgb(255, 160, 60) } else { Color32::GRAY }
+                        if active {
+                            Color32::from_rgb(255, 160, 60)
+                        } else {
+                            Color32::GRAY
+                        }
                     };
 
                     let proxy_btn = egui::SelectableLabel::new(
                         self.tab == ActiveTab::Proxy,
-                        RichText::new("Proxy").size(13.0).color(tab_color(self.tab == ActiveTab::Proxy)),
+                        RichText::new("Proxy")
+                            .size(13.0)
+                            .color(tab_color(self.tab == ActiveTab::Proxy)),
                     );
                     if ui.add(proxy_btn).clicked() {
                         self.tab = ActiveTab::Proxy;
@@ -521,7 +768,9 @@ impl RustmanApp {
                     };
                     let rep_btn = egui::SelectableLabel::new(
                         self.tab == ActiveTab::Repeater,
-                        RichText::new(rep_label).size(13.0).color(tab_color(self.tab == ActiveTab::Repeater)),
+                        RichText::new(rep_label)
+                            .size(13.0)
+                            .color(tab_color(self.tab == ActiveTab::Repeater)),
                     );
                     if ui.add(rep_btn).clicked() {
                         self.tab = ActiveTab::Repeater;
@@ -536,7 +785,9 @@ impl RustmanApp {
                     };
                     let crawl_btn = egui::SelectableLabel::new(
                         self.tab == ActiveTab::Crawler,
-                        RichText::new(crawl_label).size(13.0).color(tab_color(self.tab == ActiveTab::Crawler)),
+                        RichText::new(crawl_label)
+                            .size(13.0)
+                            .color(tab_color(self.tab == ActiveTab::Crawler)),
                     );
                     if ui.add(crawl_btn).clicked() {
                         self.tab = ActiveTab::Crawler;
@@ -544,7 +795,9 @@ impl RustmanApp {
 
                     let settings_btn = egui::SelectableLabel::new(
                         self.tab == ActiveTab::Settings,
-                        RichText::new("Settings").size(13.0).color(tab_color(self.tab == ActiveTab::Settings)),
+                        RichText::new("Settings")
+                            .size(13.0)
+                            .color(tab_color(self.tab == ActiveTab::Settings)),
                     );
                     if ui.add(settings_btn).clicked() {
                         self.tab = ActiveTab::Settings;
@@ -1294,6 +1547,53 @@ impl RustmanApp {
                                 self.crawler_attack_responses.clear();
                                 self.crawler_attack_pending = None;
                                 self.crawler_selected = None;
+                                self.crawler_findings.clear();
+                                self.crawler_all_records.clear();
+                                self.per_url_pending.clear();
+                                self.per_url_queue.clear();
+                                self.attack_status_map.clear();
+                                self.auto_attacks_sent = 0;
+                                self.auto_attacks_total = 0;
+                                self.auto_gen_queue.clear();
+                                self.auto_gen_pending = None;
+                                self.crawler_pdf_status = None;
+                            }
+
+                            ui.add_space(4.0);
+                            let pdf_btn = egui::Button::new(
+                                RichText::new("Export PDF")
+                                    .size(12.0)
+                                    .color(Color32::from_rgb(200, 180, 255)),
+                            )
+                            .fill(Color32::from_rgb(45, 35, 65));
+
+                            if ui.add(pdf_btn).clicked() {
+                                let target   = self.crawler_url.clone();
+                                let count    = self.crawler_entries.len();
+                                let records  = self.crawler_all_records.clone();
+                                let findings = self.crawler_findings.len();
+                                match crate::rapport::generate_pdf(&target, count, &records) {
+                                    Ok(bytes) => {
+                                        let ts = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs();
+                                        let name = format!("rustman_report_{ts}.pdf");
+                                        match std::fs::write(&name, &bytes) {
+                                            Ok(_) => {
+                                                self.crawler_pdf_status = Some(
+                                                    format!("Saved: {name}  ({} attack(s), {} finding(s))", records.len(), findings)
+                                                );
+                                            }
+                                            Err(e) => {
+                                                self.crawler_pdf_status = Some(format!("Write error: {e}"));
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        self.crawler_pdf_status = Some(format!("PDF error: {e}"));
+                                    }
+                                }
                             }
                         }
                     }
@@ -1315,7 +1615,41 @@ impl RustmanApp {
                             ui.add_space(6.0);
                             ui.colored_label(Color32::from_rgb(255, 160, 60), format!("↻ {active}"));
                         }
+                        // Auto-attack global progress
+                        if self.auto_attacks_sent > 0
+                            || !self.per_url_pending.is_empty()
+                            || self.auto_gen_pending.is_some()
+                            || !self.auto_gen_queue.is_empty()
+                        {
+                            ui.add_space(6.0);
+                            let gen_left = self.auto_gen_queue.len()
+                                + if self.auto_gen_pending.is_some() { 1 } else { 0 };
+                            let active  = self.per_url_pending.len();
+                            let label = if gen_left > 0 {
+                                format!("⚡ {} atk  ({} gen  {} active)", self.auto_attacks_sent, gen_left, active)
+                            } else {
+                                format!("⚡ {}/{} atk  ({} active)", self.auto_attacks_sent, self.auto_attacks_total, active)
+                            };
+                            ui.colored_label(Color32::from_rgb(255, 180, 60), label);
+                        }
+                        if !self.crawler_findings.is_empty() {
+                            ui.add_space(6.0);
+                            ui.colored_label(
+                                Color32::from_rgb(220, 120, 255),
+                                format!("⚠ {} finding(s)", self.crawler_findings.len()),
+                            );
+                        }
                     });
+
+                    if let Some(ref msg) = self.crawler_pdf_status.clone() {
+                        ui.add_space(2.0);
+                        let color = if msg.starts_with("Saved") {
+                            Color32::from_rgb(80, 200, 100)
+                        } else {
+                            Color32::from_rgb(220, 80, 80)
+                        };
+                        ui.colored_label(color, RichText::new(msg).size(10.0));
+                    }
                 }
 
                 ui.separator();
@@ -1480,12 +1814,12 @@ impl RustmanApp {
             ui.add(egui::Separator::default().spacing(4.0));
 
             let available_h = ui.available_height();
-            let has_resp    = !entry.response.is_empty();
+            let has_resp = !entry.response.is_empty();
 
             // Kick off background attack generation when entry is done and not yet generated.
-            let is_done      = matches!(entry.status, crate::crawler::EntryStatus::Done(..));
+            let is_done = matches!(entry.status, crate::crawler::EntryStatus::Done(..));
             let already_done = self.crawler_attacks_for == Some(idx);
-            let generating   = self.crawler_attacks_gen_rx.is_some();
+            let generating = self.crawler_attacks_gen_rx.is_some();
             if is_done && !already_done && !generating {
                 // Clones happen only here, not every frame.
                 let url = entry.url.clone();
@@ -1501,7 +1835,7 @@ impl RustmanApp {
             }
 
             let attack_count = self.crawler_attacks.len();
-            let has_attacks  = attack_count > 0 && already_done;
+            let has_attacks = attack_count > 0 && already_done;
 
             let (req_h, resp_h, atk_h) = if has_resp && has_attacks {
                 (available_h * 0.28, available_h * 0.28, available_h * 0.40)
@@ -1578,8 +1912,10 @@ impl RustmanApp {
                     .rounding(4.0)
                     .inner_margin(egui::Margin::symmetric(8.0, 6.0))
                     .show(ui, |ui| {
-                        ui.colored_label(Color32::from_rgb(255, 160, 60),
-                            RichText::new("↻  Generating attack variants…").size(12.0));
+                        ui.colored_label(
+                            Color32::from_rgb(255, 160, 60),
+                            RichText::new("↻  Generating attack variants…").size(12.0),
+                        );
                     });
             }
 
@@ -1597,27 +1933,116 @@ impl RustmanApp {
 
                     // ── List (top portion) ────────────────────────────────
                     ui.horizontal(|ui| {
-                        ui.colored_label(Color32::from_rgb(200, 100, 200),
-                            format!("ATTACKS  ({attack_count})"));
+                        ui.colored_label(
+                            Color32::from_rgb(200, 100, 200),
+                            format!("ATTACKS  ({attack_count})"),
+                        );
+
+                        // Auto-attack controls
+                        let auto_running = !self.per_url_pending.is_empty()
+                            || self.per_url_queue.values().any(|q| !q.is_empty())
+                            || self.auto_gen_pending.is_some()
+                            || !self.auto_gen_queue.is_empty();
+                        if auto_running {
+                            ui.add_space(6.0);
+                            let gen_left = self.auto_gen_queue.len()
+                                + if self.auto_gen_pending.is_some() { 1 } else { 0 };
+                            let active = self.per_url_pending.len();
+                            let label = if gen_left > 0 {
+                                format!(
+                                    "↻ auto  {} sent  |  {} gen  {} active",
+                                    self.auto_attacks_sent, gen_left, active,
+                                )
+                            } else {
+                                format!(
+                                    "↻ auto  {}/{}  ({} active)",
+                                    self.auto_attacks_sent, self.auto_attacks_total, active,
+                                )
+                            };
+                            ui.colored_label(
+                                Color32::from_rgb(255, 160, 60),
+                                RichText::new(label).size(11.0),
+                            );
+                            if ui.small_button(RichText::new("■ Stop").color(Color32::from_rgb(220, 80, 80))).clicked() {
+                                self.per_url_pending.clear();
+                                self.per_url_queue.clear();
+                                self.auto_gen_queue.clear();
+                                self.auto_gen_pending = None;
+                            }
+                        } else {
+                            ui.add_space(6.0);
+                            let run_btn = egui::Button::new(
+                                RichText::new("▶ Run All").size(11.0).color(Color32::from_rgb(100, 220, 130)),
+                            )
+                            .fill(Color32::from_rgb(28, 45, 32));
+                            if ui.add(run_btn).clicked() {
+                                let url = self.crawler_entries.get(idx)
+                                    .map(|e| e.url.clone())
+                                    .unwrap_or_default();
+                                if !url.is_empty() {
+                                    let variants: Vec<_> = self.crawler_attacks.iter().cloned().collect();
+                                    self.auto_attacks_total += variants.len();
+                                    {
+                                        let q = self.per_url_queue
+                                            .entry(url.clone())
+                                            .or_insert_with(std::collections::VecDeque::new);
+                                        q.extend(variants);
+                                    }
+                                    if !self.per_url_pending.contains_key(&url) {
+                                        let first = self.per_url_queue.get_mut(&url).and_then(|q| q.pop_front());
+                                        if let Some(atk) = first {
+                                            self.fire_url_attack(url, atk);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         if pending_ai.is_some() {
                             ui.add_space(8.0);
-                            ui.colored_label(Color32::from_rgb(255, 160, 60),
-                                RichText::new("↻ sending…").size(11.0));
+                            ui.colored_label(
+                                Color32::from_rgb(255, 160, 60),
+                                RichText::new("↻ sending…").size(11.0),
+                            );
                         }
                     });
                     ui.add_space(4.0);
 
                     ui.horizontal(|ui| {
                         ui.add_space(4.0);
-                        ui.colored_label(Color32::DARK_GRAY, RichText::new(format!("{:<14}", "CATEGORY")).monospace().size(10.0));
+                        ui.colored_label(
+                            Color32::DARK_GRAY,
+                            RichText::new(format!("{:<14}", "CATEGORY"))
+                                .monospace()
+                                .size(10.0),
+                        );
                         ui.add_space(4.0);
-                        ui.colored_label(Color32::DARK_GRAY, RichText::new(format!("{:<22}", "TARGET")).monospace().size(10.0));
+                        ui.colored_label(
+                            Color32::DARK_GRAY,
+                            RichText::new(format!("{:<22}", "TARGET"))
+                                .monospace()
+                                .size(10.0),
+                        );
                         ui.add_space(4.0);
-                        ui.colored_label(Color32::DARK_GRAY, RichText::new("PAYLOAD").monospace().size(10.0));
+                        ui.colored_label(
+                            Color32::DARK_GRAY,
+                            RichText::new(format!("{:<7}", "HTTP"))
+                                .monospace()
+                                .size(10.0),
+                        );
+                        ui.add_space(4.0);
+                        ui.colored_label(
+                            Color32::DARK_GRAY,
+                            RichText::new("PAYLOAD").monospace().size(10.0),
+                        );
                     });
                     ui.add(egui::Separator::default().spacing(2.0));
 
-                    let list_h = if selected_atk.is_some() { atk_h * 0.30 } else { atk_h - 32.0 };
+                    let list_h = if selected_atk.is_some() {
+                        atk_h * 0.30
+                    } else {
+                        atk_h - 32.0
+                    };
 
                     // Collect clicks outside borrow to avoid issues.
                     let mut clicked_ai: Option<usize> = None;
@@ -1628,14 +2053,18 @@ impl RustmanApp {
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             for ai in 0..self.crawler_attacks.len() {
-                                let atk     = &self.crawler_attacks[ai];
-                                let is_sel  = selected_atk == Some(ai);
-                                let has_resp = self.crawler_attack_responses.contains_key(&ai);
-                                let sending  = pending_ai == Some(ai);
-                                let row_h   = 20.0;
+                                let atk = &self.crawler_attacks[ai];
+                                let is_sel = selected_atk == Some(ai);
+                                let has_resp = self.attack_status_map.contains_key(
+                                    &(atk.url.clone(), atk.category.clone(), atk.payload.clone())
+                                ) || self.crawler_attack_responses.contains_key(&ai);
+                                let sending = pending_ai == Some(ai);
+                                let row_h = 20.0;
                                 let avail_w = ui.available_width();
                                 let (rect, resp) = ui.allocate_exact_size(
-                                    Vec2::new(avail_w, row_h), egui::Sense::click());
+                                    Vec2::new(avail_w, row_h),
+                                    egui::Sense::click(),
+                                );
 
                                 let bg = if is_sel {
                                     Color32::from_rgb(55, 35, 65)
@@ -1650,41 +2079,111 @@ impl RustmanApp {
                                     ui.horizontal(|ui| {
                                         ui.add_space(4.0);
                                         let cat_color = match atk.category.as_str() {
-                                            "SQLi"           => Color32::from_rgb(255, 140, 60),
-                                            "XSS"            => Color32::from_rgb(255, 220, 60),
-                                            "CMDi"           => Color32::from_rgb(200, 80, 80),
-                                            "PathTraversal"  => Color32::from_rgb(100, 200, 255),
-                                            "SSRF"           => Color32::from_rgb(100, 255, 180),
-                                            "SSTI"           => Color32::from_rgb(220, 100, 255),
-                                            "OpenRedirect"   => Color32::from_rgb(255, 160, 200),
-                                            "RCE"            => Color32::from_rgb(255, 60, 60),
-                                            _                => Color32::GRAY,
+                                            "SQLi" => Color32::from_rgb(255, 140, 60),
+                                            "XSS" => Color32::from_rgb(255, 220, 60),
+                                            "CMDi" => Color32::from_rgb(200, 80, 80),
+                                            "PathTraversal" => Color32::from_rgb(100, 200, 255),
+                                            "SSRF" => Color32::from_rgb(100, 255, 180),
+                                            "SSTI" => Color32::from_rgb(220, 100, 255),
+                                            "OpenRedirect" => Color32::from_rgb(255, 160, 200),
+                                            "RCE" => Color32::from_rgb(255, 60, 60),
+                                            _ => Color32::GRAY,
                                         };
-                                        ui.colored_label(cat_color,
-                                            RichText::new(format!("{:<14}", &atk.category)).monospace().size(10.0));
+                                        ui.colored_label(
+                                            cat_color,
+                                            RichText::new(format!("{:<14}", &atk.category))
+                                                .monospace()
+                                                .size(10.0),
+                                        );
                                         ui.add_space(4.0);
                                         let target_str = format!("{}", atk.target);
-                                        ui.colored_label(Color32::from_rgb(160, 160, 200),
-                                            RichText::new(format!("{:<22}", &target_str)).monospace().size(10.0));
+                                        ui.colored_label(
+                                            Color32::from_rgb(160, 160, 200),
+                                            RichText::new(format!("{:<22}", &target_str))
+                                                .monospace()
+                                                .size(10.0),
+                                        );
                                         ui.add_space(4.0);
-                                        let payload_preview = if atk.payload.len() > 55 {
-                                            format!("{}…", &atk.payload[..52])
+                                        // HTTP column: check attack_status_map first (auto-attacks),
+                                        // then crawler_attack_responses (manual click).
+                                        let http_code: Option<u16> = self.attack_status_map
+                                            .get(&(atk.url.clone(), atk.category.clone(), atk.payload.clone()))
+                                            .copied()
+                                            .or_else(|| {
+                                                self.crawler_attack_responses.get(&ai).and_then(|b| {
+                                                    std::str::from_utf8(b).ok()?
+                                                        .lines().next()?
+                                                        .split_whitespace().nth(1)?
+                                                        .parse().ok()
+                                                })
+                                            });
+                                        let http_label = http_code.map(|code| {
+                                            let is_vuln = self.crawler_findings.iter().any(|f| {
+                                                f.url == atk.url
+                                                    && f.category == atk.category
+                                                    && f.payload == atk.payload
+                                            });
+                                            let color = if is_vuln {
+                                                Color32::from_rgb(255, 80, 80)
+                                            } else {
+                                                match code {
+                                                    200..=299 => Color32::from_rgb(80, 200, 120),
+                                                    300..=399 => Color32::from_rgb(100, 180, 255),
+                                                    400..=499 => Color32::from_rgb(255, 180, 60),
+                                                    500..=599 => Color32::from_rgb(255, 100, 60),
+                                                    _ => Color32::GRAY,
+                                                }
+                                            };
+                                            (format!("{:<7}", code), color)
+                                        });
+                                        if let Some((label, color)) = http_label {
+                                            ui.colored_label(
+                                                color,
+                                                RichText::new(label).monospace().size(10.0),
+                                            );
+                                        } else {
+                                            ui.colored_label(
+                                                Color32::from_rgb(60, 60, 60),
+                                                RichText::new(format!("{:<7}", "—"))
+                                                    .monospace()
+                                                    .size(10.0),
+                                            );
+                                        }
+                                        ui.add_space(4.0);
+                                        let payload_preview = if atk.payload.len() > 45 {
+                                            format!("{}…", &atk.payload[..42])
                                         } else {
                                             atk.payload.clone()
                                         };
-                                        ui.colored_label(Color32::from_rgb(200, 200, 120),
-                                            RichText::new(&payload_preview).monospace().size(10.0));
-                                        // Status indicator
-                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            ui.add_space(4.0);
-                                            if sending {
-                                                ui.colored_label(Color32::from_rgb(255, 160, 60),
-                                                    RichText::new("↻").size(10.0));
-                                            } else if has_resp {
-                                                ui.colored_label(Color32::from_rgb(80, 200, 80),
-                                                    RichText::new("✓").size(10.0));
-                                            }
-                                        });
+                                        ui.colored_label(
+                                            Color32::from_rgb(200, 200, 120),
+                                            RichText::new(&payload_preview).monospace().size(10.0),
+                                        );
+                                        // Sending / VULN badge (right-aligned)
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.add_space(4.0);
+                                                if sending {
+                                                    ui.colored_label(
+                                                        Color32::from_rgb(255, 160, 60),
+                                                        RichText::new("↻").size(10.0),
+                                                    );
+                                                } else if has_resp {
+                                                    let is_vuln = self.crawler_findings.iter().any(|f| {
+                                                        f.url == atk.url
+                                                            && f.category == atk.category
+                                                            && f.payload == atk.payload
+                                                    });
+                                                    if is_vuln {
+                                                        ui.colored_label(
+                                                            Color32::from_rgb(255, 80, 80),
+                                                            RichText::new("VULN").strong().size(10.0),
+                                                        );
+                                                    }
+                                                }
+                                            },
+                                        );
                                     });
                                 });
 
@@ -1704,14 +2203,16 @@ impl RustmanApp {
                             {
                                 if let Some(atk) = self.crawler_attacks.get(ai) {
                                     if let Some(parts) = crate::crawler::parse_url(&atk.url) {
-                                        let raw  = atk.raw_request.clone();
+                                        let raw = atk.raw_request.clone();
                                         let host = parts.host;
                                         let port = parts.port;
-                                        let tls  = parts.tls;
+                                        let tls = parts.tls;
                                         let (tx, rx) = std::sync::mpsc::sync_channel(1);
                                         self.crawler_attack_pending = Some((ai, rx));
                                         self.rt.spawn(async move {
-                                            let resp = crate::proxy::repeater_send(&host, port, tls, raw).await;
+                                            let resp =
+                                                crate::proxy::repeater_send(&host, port, tls, raw)
+                                                    .await;
                                             let _ = tx.send(resp);
                                         });
                                     }
@@ -1726,10 +2227,12 @@ impl RustmanApp {
                             ui.add_space(4.0);
                             ui.add(egui::Separator::default().spacing(2.0));
 
-                            let detail_h  = atk_h * 0.65;
-                            let half_h    = detail_h * 0.48;
-                            let req_text  = String::from_utf8_lossy(&atk.raw_request).into_owned();
-                            let resp_text = self.crawler_attack_responses.get(&ai)
+                            let detail_h = atk_h * 0.65;
+                            let half_h = detail_h * 0.48;
+                            let req_text = String::from_utf8_lossy(&atk.raw_request).into_owned();
+                            let resp_text = self
+                                .crawler_attack_responses
+                                .get(&ai)
                                 .map(|b| String::from_utf8_lossy(b).into_owned());
 
                             // Request pane
@@ -1739,20 +2242,24 @@ impl RustmanApp {
                                 .inner_margin(egui::Margin::symmetric(6.0, 4.0))
                                 .show(ui, |ui| {
                                     ui.set_max_height(half_h);
-                                    ui.colored_label(Color32::DARK_GRAY,
-                                        format!("REQUEST  {}  {}", atk.category, atk.target));
+                                    ui.colored_label(
+                                        Color32::DARK_GRAY,
+                                        format!("REQUEST  {}  {}", atk.category, atk.target),
+                                    );
                                     ui.add_space(2.0);
                                     ScrollArea::vertical()
                                         .id_salt(format!("atk_req_{ai}"))
                                         .max_height(half_h - 28.0)
                                         .show(ui, |ui| {
                                             let mut t = req_text;
-                                            ui.add(TextEdit::multiline(&mut t)
-                                                .font(egui::TextStyle::Monospace)
-                                                .desired_width(f32::INFINITY)
-                                                .interactive(false)
-                                                .frame(false)
-                                                .text_color(Color32::from_rgb(210, 210, 220)));
+                                            ui.add(
+                                                TextEdit::multiline(&mut t)
+                                                    .font(egui::TextStyle::Monospace)
+                                                    .desired_width(f32::INFINITY)
+                                                    .interactive(false)
+                                                    .frame(false)
+                                                    .text_color(Color32::from_rgb(210, 210, 220)),
+                                            );
                                         });
                                 });
 
@@ -1774,18 +2281,23 @@ impl RustmanApp {
                                                 .max_height(half_h - 28.0)
                                                 .show(ui, |ui| {
                                                     let mut s = t;
-                                                    ui.add(TextEdit::multiline(&mut s)
-                                                        .font(egui::TextStyle::Monospace)
-                                                        .desired_width(f32::INFINITY)
-                                                        .interactive(false)
-                                                        .frame(false)
-                                                        .text_color(Color32::from_rgb(180, 210, 180)));
+                                                    ui.add(
+                                                        TextEdit::multiline(&mut s)
+                                                            .font(egui::TextStyle::Monospace)
+                                                            .desired_width(f32::INFINITY)
+                                                            .interactive(false)
+                                                            .frame(false)
+                                                            .text_color(Color32::from_rgb(
+                                                                180, 210, 180,
+                                                            )),
+                                                    );
                                                 });
                                         }
                                         None => {
                                             ui.colored_label(
                                                 Color32::from_rgb(255, 160, 60),
-                                                RichText::new("↻  sending request…").size(12.0));
+                                                RichText::new("↻  sending request…").size(12.0),
+                                            );
                                         }
                                     }
                                 });
@@ -2134,7 +2646,16 @@ impl RustmanApp {
                     s.requests
                         .iter()
                         .enumerate()
-                        .map(|(i, r)| (i, r.id, r.method.clone(), r.host.clone(), r.port, r.url.clone()))
+                        .map(|(i, r)| {
+                            (
+                                i,
+                                r.id,
+                                r.method.clone(),
+                                r.host.clone(),
+                                r.port,
+                                r.url.clone(),
+                            )
+                        })
                         .collect()
                 };
 
@@ -2142,9 +2663,11 @@ impl RustmanApp {
                     ui.add_space(20.0);
                     ui.centered_and_justified(|ui| {
                         ui.label(
-                            RichText::new("No requests intercepted yet.\nBrowse with the proxy active.")
-                                .size(12.0)
-                                .color(Color32::from_rgb(70, 70, 80)),
+                            RichText::new(
+                                "No requests intercepted yet.\nBrowse with the proxy active.",
+                            )
+                            .size(12.0)
+                            .color(Color32::from_rgb(70, 70, 80)),
                         );
                     });
                 } else {
@@ -2159,7 +2682,8 @@ impl RustmanApp {
                                 let row_h = 24.0;
                                 let avail_w = ui.available_width();
                                 let (rect, resp) = ui.allocate_exact_size(
-                                    Vec2::new(avail_w, row_h), egui::Sense::click(),
+                                    Vec2::new(avail_w, row_h),
+                                    egui::Sense::click(),
                                 );
 
                                 let bg = if is_sel {
@@ -2178,7 +2702,9 @@ impl RustmanApp {
                                         ui.add_space(8.0);
                                         ui.colored_label(
                                             Color32::DARK_GRAY,
-                                            RichText::new(format!("#{id:<4}")).monospace().size(10.0),
+                                            RichText::new(format!("#{id:<4}"))
+                                                .monospace()
+                                                .size(10.0),
                                         );
                                         ui.colored_label(
                                             mc,
@@ -2262,10 +2788,7 @@ impl RustmanApp {
                             .color(Color32::from_rgb(255, 160, 60)),
                     );
                     ui.add_space(12.0);
-                    ui.colored_label(
-                        Color32::DARK_GRAY,
-                        "AI-assisted PoC exploit development",
-                    );
+                    ui.colored_label(Color32::DARK_GRAY, "AI-assisted PoC exploit development");
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(8.0);
@@ -2308,7 +2831,10 @@ impl RustmanApp {
                                 )
                                 .fill(Color32::from_rgb(200, 120, 30));
 
-                                if ui.add_enabled(!self.exploit_thinking, analyze_btn).clicked() {
+                                if ui
+                                    .add_enabled(!self.exploit_thinking, analyze_btn)
+                                    .clicked()
+                                {
                                     self.exploit_send_analyze(ctx);
                                 }
                             });
@@ -2356,55 +2882,67 @@ impl RustmanApp {
                         for (i, msg) in self.exploit_messages.iter().enumerate() {
                             ui.add_space(6.0);
                             if msg.from_user {
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                                    ui.add_space(8.0);
-                                    egui::Frame::none()
-                                        .fill(Color32::from_rgb(55, 35, 15))
-                                        .rounding(8.0)
-                                        .inner_margin(egui::Margin::symmetric(10.0, 6.0))
-                                        .show(ui, |ui| {
-                                            ui.set_max_width(ui.available_width() * 0.75);
-                                            ui.label(
-                                                RichText::new(&msg.text)
-                                                    .size(13.0)
-                                                    .color(Color32::from_rgb(255, 220, 180)),
-                                            );
-                                        });
-                                });
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::TOP),
+                                    |ui| {
+                                        ui.add_space(8.0);
+                                        egui::Frame::none()
+                                            .fill(Color32::from_rgb(55, 35, 15))
+                                            .rounding(8.0)
+                                            .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                                            .show(ui, |ui| {
+                                                ui.set_max_width(ui.available_width() * 0.75);
+                                                ui.label(
+                                                    RichText::new(&msg.text)
+                                                        .size(13.0)
+                                                        .color(Color32::from_rgb(255, 220, 180)),
+                                                );
+                                            });
+                                    },
+                                );
                             } else {
                                 ui.add_space(2.0);
-                                ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
-                                    ui.add_space(8.0);
-                                    ui.vertical(|ui| {
-                                        // Render message with code blocks highlighted
-                                        egui::Frame::none()
-                                            .fill(Color32::from_rgb(26, 28, 38))
-                                            .rounding(8.0)
-                                            .inner_margin(egui::Margin::symmetric(10.0, 8.0))
-                                            .show(ui, |ui| {
-                                                ui.set_max_width(ui.available_width() * 0.9);
-                                                render_message_with_code(ui, &msg.text, i);
-                                            });
+                                ui.with_layout(
+                                    egui::Layout::left_to_right(egui::Align::TOP),
+                                    |ui| {
+                                        ui.add_space(8.0);
+                                        ui.vertical(|ui| {
+                                            // Render message with code blocks highlighted
+                                            egui::Frame::none()
+                                                .fill(Color32::from_rgb(26, 28, 38))
+                                                .rounding(8.0)
+                                                .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                                                .show(ui, |ui| {
+                                                    ui.set_max_width(ui.available_width() * 0.9);
+                                                    render_message_with_code(ui, &msg.text, i);
+                                                });
 
-                                        // "→ Editor" button if the message contains code
-                                        let code = extract_code_blocks(&msg.text);
-                                        if !code.is_empty() {
-                                            ui.add_space(3.0);
-                                            ui.horizontal(|ui| {
-                                                ui.add_space(2.0);
-                                                let btn = egui::Button::new(
-                                                    RichText::new("  → Editor  ")
-                                                        .size(11.0)
-                                                        .color(Color32::BLACK),
-                                                )
-                                                .fill(Color32::from_rgb(180, 110, 20));
-                                                if ui.add(btn).on_hover_text("Send code to the editor panel").clicked() {
-                                                    send_to_editor = Some(code);
-                                                }
-                                            });
-                                        }
-                                    });
-                                });
+                                            // "→ Editor" button if the message contains code
+                                            let code = extract_code_blocks(&msg.text);
+                                            if !code.is_empty() {
+                                                ui.add_space(3.0);
+                                                ui.horizontal(|ui| {
+                                                    ui.add_space(2.0);
+                                                    let btn = egui::Button::new(
+                                                        RichText::new("  → Editor  ")
+                                                            .size(11.0)
+                                                            .color(Color32::BLACK),
+                                                    )
+                                                    .fill(Color32::from_rgb(180, 110, 20));
+                                                    if ui
+                                                        .add(btn)
+                                                        .on_hover_text(
+                                                            "Send code to the editor panel",
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        send_to_editor = Some(code);
+                                                    }
+                                                });
+                                            }
+                                        });
+                                    },
+                                );
                             }
                         }
                         if let Some(code) = send_to_editor {
@@ -2441,22 +2979,27 @@ impl RustmanApp {
                 ui.add(egui::Separator::default().spacing(4.0));
                 ui.horizontal(|ui| {
                     let te = TextEdit::singleline(&mut self.exploit_input)
-                        .hint_text("Ask about the request, request a PoC, suggest a payload… (Enter)")
+                        .hint_text(
+                            "Ask about the request, request a PoC, suggest a payload… (Enter)",
+                        )
                         .desired_width(ui.available_width() - 80.0)
                         .font(egui::TextStyle::Body);
                     let resp = ui.add(te);
 
-                    let send_label = if self.exploit_thinking { "  …  " } else { "  Send  " };
+                    let send_label = if self.exploit_thinking {
+                        "  …  "
+                    } else {
+                        "  Send  "
+                    };
                     let send_btn = ui.add_enabled(
                         !self.exploit_thinking,
-                        egui::Button::new(
-                            RichText::new(send_label).color(Color32::BLACK),
-                        )
-                        .fill(if self.exploit_thinking {
-                            Color32::from_rgb(60, 50, 30)
-                        } else {
-                            Color32::from_rgb(200, 120, 30)
-                        }),
+                        egui::Button::new(RichText::new(send_label).color(Color32::BLACK)).fill(
+                            if self.exploit_thinking {
+                                Color32::from_rgb(60, 50, 30)
+                            } else {
+                                Color32::from_rgb(200, 120, 30)
+                            },
+                        ),
                     );
 
                     let send_clicked = !self.exploit_thinking
@@ -2520,7 +3063,10 @@ impl RustmanApp {
             });
             return;
         }
-        self.exploit_messages.push(ExploitMessage { from_user: true, text });
+        self.exploit_messages.push(ExploitMessage {
+            from_user: true,
+            text,
+        });
         let history = self.exploit_build_history();
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let state_clone = self.state.clone();
@@ -2531,7 +3077,8 @@ impl RustmanApp {
                 state_clone,
                 history,
                 tx,
-            ).await;
+            )
+            .await;
         });
         self.exploit_rx = Some(rx);
         self.exploit_thinking = true;
@@ -2845,7 +3392,11 @@ fn render_message_with_code(ui: &mut egui::Ui, text: &str, msg_idx: usize) {
                                     .interactive(true)
                                     .frame(false)
                                     .text_color(Color32::from_rgb(140, 220, 140))
-                                    .id(egui::Id::new(("exploit_code_block", msg_idx, block_count))),
+                                    .id(egui::Id::new((
+                                        "exploit_code_block",
+                                        msg_idx,
+                                        block_count,
+                                    ))),
                             );
                         });
                     block_count += 1;

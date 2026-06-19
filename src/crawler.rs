@@ -80,16 +80,49 @@ pub async fn run(
     };
 
     let (base_host, base_port, base_tls) = (base.0.clone(), base.1, base.2);
-    let mut visited: HashSet<String> = HashSet::new();
+    let mut visited: HashSet<String>         = HashSet::new();
+    let mut visited_js: HashSet<String>      = HashSet::new();
     let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+    // JS files queued for API route extraction: (url, depth-of-parent-page)
+    let mut js_queue: VecDeque<(String, usize)> = VecDeque::new();
 
     visited.insert(canonical(&start_url));
     queue.push_back((start_url, 0));
 
-    while let Some((url, depth)) = queue.pop_front() {
+    loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
+
+        // ── Drain pending JS files before processing the next HTML page ──────
+        while let Some((js_url, parent_depth)) = js_queue.pop_front() {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            if parent_depth >= max_depth {
+                continue;
+            }
+            let Some((jh, jp, jt, jpath)) = parse_url_parts(&js_url) else { continue };
+            let js_req = format!(
+                "GET {jpath} HTTP/1.1\r\nHost: {jh}\r\nUser-Agent: rustman-crawler/1.0\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+            ).into_bytes();
+            let js_resp = crate::proxy::repeater_send(&jh, jp, jt, js_req).await;
+            let (js_st, js_body) = split_response(&js_resp);
+            if js_st == 200 {
+                enqueue_js_routes(
+                    &js_body,
+                    &base_host,
+                    base_tls,
+                    base_port,
+                    parent_depth,
+                    max_depth,
+                    &mut visited,
+                    &mut queue,
+                );
+            }
+        }
+
+        let Some((url, depth)) = queue.pop_front() else { break };
 
         let (host, port, tls, path) = match parse_url_parts(&url) {
             Some(p) => p,
@@ -116,6 +149,7 @@ pub async fn run(
         let (status, body) = split_response(&resp);
 
         let new_links = if depth < max_depth && status == 200 {
+            // HTML links
             let links = extract_links(&body, &base_host, base_tls, base_port, &path);
             let mut count = 0;
             for link in links {
@@ -126,6 +160,32 @@ pub async fn run(
                     count += 1;
                 }
             }
+
+            // External JS files (<script src="...">)
+            let scripts = extract_script_srcs(&body, &base_host, base_tls, base_port, &path);
+            for js_url in scripts {
+                let key = canonical(&js_url);
+                if !visited_js.contains(&key) {
+                    visited_js.insert(key);
+                    js_queue.push_back((js_url, depth));
+                }
+            }
+
+            // Inline JS (<script> without src)
+            let inline = extract_inline_js(&body);
+            if !inline.is_empty() {
+                enqueue_js_routes(
+                    &inline,
+                    &base_host,
+                    base_tls,
+                    base_port,
+                    depth,
+                    max_depth,
+                    &mut visited,
+                    &mut queue,
+                );
+            }
+
             count
         } else {
             0
@@ -254,6 +314,411 @@ fn extract_links(
     }
 
     links
+}
+
+// ── SPA / JS route extraction ─────────────────────────────────────────────────
+
+/// Returns `true` if the JS URL looks like a third-party library or vendor bundle
+/// that belongs to a framework/plugin rather than the site's own application code.
+fn is_vendor_js(url: &str) -> bool {
+    let path = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
+
+    // Paths that indicate dependency directories
+    const VENDOR_PATHS: &[&str] = &[
+        "/node_modules/",
+        "/bower_components/",
+        "/vendor/",
+        "/vendors/",
+        "/assets/libs/",
+        "/assets/vendor/",
+        "/assets/plugins/",
+        "/static/libs/",
+        "/static/vendor/",
+        "/lib/",
+        "/libs/",
+        "/plugins/",
+        "/cdn/",
+    ];
+    if VENDOR_PATHS.iter().any(|p| path.contains(p)) {
+        return true;
+    }
+
+    // Extract just the filename
+    let filename = path.split('/').next_back().unwrap_or(&path);
+    // Strip query and hash
+    let filename = filename.split('?').next().unwrap_or(filename);
+    let filename = filename.split('#').next().unwrap_or(filename);
+    // Strip .min.js, .bundle.js, etc.
+    let stem = filename
+        .strip_suffix(".js").unwrap_or(filename)
+        .strip_suffix(".min").unwrap_or(filename.strip_suffix(".js").unwrap_or(filename))
+        .to_ascii_lowercase();
+
+    // Known library / framework names in filename
+    const KNOWN_LIBS: &[&str] = &[
+        "jquery", "jquery-ui", "jquery-migrate",
+        "lodash", "underscore", "ramda",
+        "backbone", "ember", "knockout", "prototype", "mootools",
+        "bootstrap", "foundation", "materialize", "bulma",
+        "moment", "dayjs", "date-fns", "luxon",
+        "d3", "chart", "echarts", "highcharts", "apexcharts", "recharts",
+        "leaflet", "mapbox", "openlayers",
+        "three", "babylon", "pixi", "phaser",
+        "gsap", "anime", "tween",
+        "popper", "tippy", "sweetalert", "toastr", "notyf",
+        "alpinejs", "htmx", "stimulus",
+        "swiper", "slick", "glide", "splide",
+        "fontawesome", "feather",
+        "crypto-js", "forge",
+        "socket.io", "sockjs",
+        "pdfmake", "jspdf", "xlsx",
+    ];
+    if KNOWN_LIBS.iter().any(|lib| stem.starts_with(lib) || stem.contains(&format!("-{lib}")) || stem.contains(&format!(".{lib}"))) {
+        return true;
+    }
+
+    // Webpack vendor chunk patterns
+    const VENDOR_STEMS: &[&str] = &[
+        "vendor", "vendors", "chunk-vendors", "vendors~",
+        "polyfill", "polyfills", "runtime", "runtime~",
+        "commons", "common~", "framework",
+    ];
+    if VENDOR_STEMS.iter().any(|p| stem.starts_with(p) || stem == *p) {
+        return true;
+    }
+
+    false
+}
+
+/// Extract `<script src="...">` URLs from an HTML page.
+fn extract_script_srcs(
+    html: &str,
+    base_host: &str,
+    base_tls: bool,
+    base_port: u16,
+    current_path: &str,
+) -> Vec<String> {
+    let lower = html.to_ascii_lowercase();
+    let mut pos = 0;
+    let mut srcs = Vec::new();
+
+    loop {
+        let Some(off) = lower[pos..].find("<script") else { break };
+        let tag_start = pos + off + 7;
+        let Some(gt_off) = lower[tag_start..].find('>') else { break };
+        let tag_lc = &lower[tag_start..tag_start + gt_off];
+        let tag_orig = &html[tag_start..tag_start + gt_off];
+        pos = tag_start + gt_off + 1;
+
+        let Some(src_off) = tag_lc.find("src=") else { continue };
+        let after = src_off + 4;
+        if after >= tag_orig.len() { continue; }
+        let (q, str_start) = match tag_orig.as_bytes()[after] {
+            b'"' => (b'"', after + 1),
+            b'\'' => (b'\'', after + 1),
+            _ => continue,
+        };
+        let Some(str_end) = tag_orig[str_start..].find(q as char) else { continue };
+        let src = &tag_orig[str_start..str_start + str_end];
+
+        // Only JS files, and only the site's own application code
+        let src_lc = src.to_ascii_lowercase();
+        if !src_lc.ends_with(".js") && !src_lc.contains(".js?") && !src_lc.contains(".js#") {
+            continue;
+        }
+        if let Some(url) = resolve(src, base_host, base_tls, base_port, current_path) {
+            if !is_vendor_js(&url) {
+                srcs.push(url);
+            }
+        }
+    }
+    srcs
+}
+
+/// Concatenate the content of inline `<script>` blocks (no src attribute).
+fn extract_inline_js(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let mut pos = 0;
+    let mut out = String::new();
+
+    loop {
+        let Some(off) = lower[pos..].find("<script") else { break };
+        let tag_start = pos + off + 7;
+        let Some(gt_off) = lower[tag_start..].find('>') else { break };
+        let tag_lc = &lower[tag_start..tag_start + gt_off];
+        pos = tag_start + gt_off + 1;
+
+        if tag_lc.contains("src=") { continue; } // external — handled separately
+
+        let Some(close_off) = lower[pos..].find("</script>") else { break };
+        out.push_str(&html[pos..pos + close_off]);
+        out.push('\n');
+        pos += close_off + 9;
+    }
+    out
+}
+
+/// Scan JS source for API route strings and add new ones to the crawl queue.
+fn enqueue_js_routes(
+    js: &str,
+    base_host: &str,
+    base_tls: bool,
+    base_port: u16,
+    parent_depth: usize,
+    max_depth: usize,
+    visited: &mut HashSet<String>,
+    queue: &mut VecDeque<(String, usize)>,
+) {
+    if parent_depth >= max_depth { return; }
+    let routes = extract_api_routes_from_js(js);
+    let proto   = if base_tls { "https" } else { "http" };
+    let port_sfx = match (base_tls, base_port) {
+        (true, 443) | (false, 80) => String::new(),
+        _ => format!(":{base_port}"),
+    };
+    for route in routes {
+        let full_url = if route.starts_with("http://") || route.starts_with("https://") {
+            if let Some((rh, _, _, _)) = parse_url_parts(&route) {
+                // Accept: same domain as crawler target, OR any IP/localhost (any port).
+                // Reject: a different named domain — it belongs to another site.
+                if !rh.eq_ignore_ascii_case(base_host) && !is_ip_host(&rh) {
+                    continue;
+                }
+            }
+            route
+        } else {
+            format!("{proto}://{base_host}{port_sfx}{route}")
+        };
+        let key = canonical(&full_url);
+        if !visited.contains(&key) && is_crawlable(&full_url) {
+            visited.insert(key);
+            queue.push_back((full_url, parent_depth + 1));
+        }
+    }
+}
+
+/// Extract API-looking path strings from JavaScript / TypeScript source.
+pub fn extract_api_routes_from_js(js: &str) -> Vec<String> {
+    let mut routes = Vec::new();
+
+    // Patterns that are immediately followed by a string argument containing the URL.
+    const CALL_PATTERNS: &[&str] = &[
+        "fetch(",
+        "axios.get(",
+        "axios.post(",
+        "axios.put(",
+        "axios.delete(",
+        "axios.patch(",
+        "axios.request(",
+        "$.get(",
+        "$.post(",
+        "$.put(",
+        "$.delete(",
+        "$http.get(",
+        "$http.post(",
+        "$http.put(",
+        "$http.delete(",
+        "this.http.get(",
+        "this.http.post(",
+        "this.http.put(",
+        "this.http.delete(",
+        "http.get(",
+        "http.post(",
+        "http.put(",
+        "http.delete(",
+        "request.get(",
+        "request.post(",
+        "superagent.get(",
+        "superagent.post(",
+        "got.get(",
+        "got.post(",
+        "ky.get(",
+        "ky.post(",
+    ];
+
+    // Key-value patterns where the value is the URL.
+    const KV_PATTERNS: &[&str] = &[
+        "url:",
+        "url :",
+        "baseURL:",
+        "baseUrl:",
+        "endpoint:",
+        "apiUrl:",
+        "apiURL:",
+        "path:",
+        "path :",
+        "route:",
+        "href:",
+        "action:",
+    ];
+
+    // String literal prefixes that indicate an API path even without surrounding context.
+    const PATH_PREFIXES: &[&str] = &[
+        "/api/",
+        "/v1/",
+        "/v2/",
+        "/v3/",
+        "/v4/",
+        "/v5/",
+        "/graphql",
+        "/gql",
+        "/rest/",
+        "/oauth",
+        "/oauth2",
+        "/auth/",
+        "/login",
+        "/logout",
+        "/register",
+        "/signup",
+        "/user/",
+        "/users/",
+        "/admin/",
+        "/search",
+        "/account",
+        "/profile",
+        "/settings",
+        "/config",
+        "/data/",
+        "/rpc",
+        "/ws",
+        "/socket",
+        "/stream",
+    ];
+
+    // Scan call patterns
+    for pat in CALL_PATTERNS {
+        let mut pos = 0;
+        while let Some(i) = js[pos..].find(pat) {
+            let after = pos + i + pat.len();
+            if let Some((s, _)) = next_string_literal(js, after) {
+                if looks_like_api_path(&s) {
+                    routes.push(s);
+                }
+            }
+            pos += i + 1;
+        }
+    }
+
+    // Scan key-value patterns
+    for pat in KV_PATTERNS {
+        let mut pos = 0;
+        while let Some(i) = js[pos..].find(pat) {
+            let after = pos + i + pat.len();
+            if let Some((s, _)) = next_string_literal(js, after) {
+                if looks_like_api_path(&s) {
+                    routes.push(s);
+                }
+            }
+            pos += i + 1;
+        }
+    }
+
+    // Scan direct string literals matching known API prefixes
+    for prefix in PATH_PREFIXES {
+        for &q in &[b'"', b'\'', b'`'] {
+            let search: Vec<u8> = std::iter::once(q).chain(prefix.bytes()).collect();
+            let mut pos = 0;
+            while let Some(i) = find_bytes(js.as_bytes(), &search, pos) {
+                let str_start = i + 1; // after opening quote
+                if let Some((s, _)) = extract_until_closing_quote(js, str_start, q) {
+                    if looks_like_api_path(&s) {
+                        routes.push(s);
+                    }
+                }
+                pos = i + 1;
+            }
+        }
+    }
+
+    routes.sort();
+    routes.dedup();
+    routes
+}
+
+/// Find the next string literal (starting with `"`, `'`, or `` ` ``) at or after `start`,
+/// skipping leading whitespace.  Returns the unescaped content and the index after the
+/// closing quote.
+fn next_string_literal(s: &str, start: usize) -> Option<(String, usize)> {
+    let bytes = s.as_bytes();
+    let mut i = start;
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r' | b'(' | b'[') {
+        i += 1;
+    }
+    if i >= bytes.len() { return None; }
+    match bytes[i] {
+        q @ (b'"' | b'\'' | b'`') => extract_until_closing_quote(s, i + 1, q),
+        _ => None,
+    }
+}
+
+/// Extract a string literal from `start` until the matching closing `quote` byte,
+/// handling backslash escapes.  Returns `(content, end_index_after_closing_quote)`.
+fn extract_until_closing_quote(s: &str, start: usize, quote: u8) -> Option<(String, usize)> {
+    let bytes = s.as_bytes();
+    let mut result = String::new();
+    let mut i = start;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 2; // skip escape sequence
+            continue;
+        }
+        if bytes[i] == quote {
+            return Some((result, i + 1));
+        }
+        // Stop on newline for single/double-quoted strings (template literals allow them)
+        if quote != b'`' && (bytes[i] == b'\n' || bytes[i] == b'\r') {
+            return None;
+        }
+        if bytes[i].is_ascii() {
+            result.push(bytes[i] as char);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8], start: usize) -> Option<usize> {
+    if needle.is_empty() || start + needle.len() > haystack.len() { return None; }
+    haystack[start..].windows(needle.len()).position(|w| w == needle).map(|p| p + start)
+}
+
+/// Returns `true` if `host` (already stripped of port by `parse_url_parts`) is an
+/// IP address or localhost — meaning we accept it regardless of the crawler domain.
+fn is_ip_host(host: &str) -> bool {
+    // localhost (any case)
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    // IPv4: exactly 4 dot-separated decimal octets
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.len() == 4 && parts.iter().all(|s| s.parse::<u8>().is_ok()) {
+        return true;
+    }
+    // IPv6 (bare like ::1, or bracketed like [::1]): contains a colon
+    if host.contains(':') {
+        return true;
+    }
+    false
+}
+
+fn looks_like_api_path(s: &str) -> bool {
+    if s.is_empty() || s.len() > 512 { return false; }
+    // Must start with / or http
+    if !s.starts_with('/') && !s.starts_with("http://") && !s.starts_with("https://") {
+        return false;
+    }
+    // Reject template expressions
+    if s.contains("${") { return false; }
+    // Reject static asset extensions
+    let lower = s.split('?').next().unwrap_or(s).to_ascii_lowercase();
+    const SKIP: &[&str] = &[
+        ".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg",
+        ".ico", ".woff", ".woff2", ".ttf", ".eot", ".map", ".json",
+    ];
+    if SKIP.iter().any(|e| lower.ends_with(e)) { return false; }
+    // Must be more than just "/"
+    if s == "/" { return false; }
+    true
 }
 
 fn resolve(

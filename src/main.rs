@@ -5,6 +5,7 @@ mod crawler;
 mod gui;
 mod mcp;
 mod proxy;
+mod rapport;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -31,18 +32,15 @@ fn main() {
 
     let state: app::Shared = Arc::new(Mutex::new(app::AppState::new()));
 
-    // ── Proxy manager ─────────────────────────────────────────────────────────
-    // Channel: GUI sends (addr, port) → manager stops the old proxy, starts a new one.
     let (restart_tx, restart_rx) = std::sync::mpsc::sync_channel::<(String, u16)>(1);
     state.lock().unwrap().proxy_restart_tx = Some(restart_tx.clone());
 
-    // Start the first proxy instance.
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(String, u16), String>>(0);
     let initial_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
-        let stop  = initial_stop.clone();
-        let s     = state.clone();
-        let c     = ca.clone();
+        let stop = initial_stop.clone();
+        let s = state.clone();
+        let c = ca.clone();
         let ready = ready_tx;
         std::thread::spawn(move || {
             tokio::runtime::Runtime::new()
@@ -51,7 +49,10 @@ fn main() {
         });
     }
 
-    match ready_rx.recv().unwrap_or_else(|_| Err("proxy thread died".into())) {
+    match ready_rx
+        .recv()
+        .unwrap_or_else(|_| Err("proxy thread died".into()))
+    {
         Ok((addr, port)) => {
             eprintln!("[rustman] proxy listening on {addr}:{port}");
             let mut s = state.lock().unwrap();
@@ -64,10 +65,9 @@ fn main() {
         }
     }
 
-    // Background thread: listens for restart requests from the GUI.
     {
         let mgr_state = state.clone();
-        let mgr_ca    = ca.clone();
+        let mgr_ca = ca.clone();
         let mut cur_stop = initial_stop;
         std::thread::spawn(move || {
             for (new_addr, new_port) in restart_rx {
@@ -79,7 +79,8 @@ fn main() {
                 let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 cur_stop = stop.clone();
 
-                let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(String, u16), String>>(0);
+                let (ready_tx, ready_rx) =
+                    std::sync::mpsc::sync_channel::<Result<(String, u16), String>>(0);
                 {
                     let s = mgr_state.clone();
                     let c = mgr_ca.clone();
