@@ -3314,7 +3314,10 @@ impl RustmanApp {
                         params.push(fallback);
                     }
 
-                    // Test every payload on every parameter — no early stop.
+                    let total_ep_payloads: usize = params.len()
+                        * payloads2.as_ref().iter().map(|(_, p)| p.len()).sum::<usize>();
+                    let mut processed = 0usize;
+
                     'ep_loop: for (param, loc) in &params {
                         for (cat, plist) in payloads2.as_ref() {
                             if stop2.load(Ordering::Relaxed) { break 'ep_loop; }
@@ -3323,6 +3326,7 @@ impl RustmanApp {
 
                             for payload in plist {
                                 if stop2.load(Ordering::Relaxed) { break 'ep_loop; }
+                                processed += 1;
 
                                 let raw = ep2.build_request_fuzzed(
                                     &host2, port, tls,
@@ -3352,6 +3356,7 @@ impl RustmanApp {
                                     }
                                 };
 
+                                let vuln_confirmed = evidence.is_some();
                                 let _ = tx2.send(ScanMsg::Result(ScanResult {
                                     ep_idx,
                                     param:    param.clone(),
@@ -3363,6 +3368,14 @@ impl RustmanApp {
                                     evidence,
                                     raw_request,
                                 }));
+
+                                if vuln_confirmed {
+                                    let remaining = total_ep_payloads - processed;
+                                    if remaining > 0 {
+                                        let _ = tx2.send(ScanMsg::Skipped(remaining));
+                                    }
+                                    break 'ep_loop;
+                                }
                             }
                         }
                     }

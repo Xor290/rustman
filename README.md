@@ -16,7 +16,9 @@
 | **Repeater** | Replay and modify captured requests manually |
 | **Crawler** | Recursive BFS crawler with automatic OWASP payload injection |
 | **Attacks** | 240+ payloads per category injected into URL params, headers and body |
-| **Claude** | In-app AI assistant (Anthropic API) with Pentest mode |
+| **OpenAPI Scanner** | Parse OpenAPI / Swagger specs and fuzz every endpoint and parameter |
+| **CI/CD CLI** | Headless scan mode — pipe reports into pipelines, exit 1 on vuln |
+| **Claude** | In-app AI assistant (Anthropic API key required) — dev/exploit mode |
 | **MCP Server** | Expose proxy tools to Claude Code via Model Context Protocol |
 | **Settings** | Configurable bind address/port, intercept toggle, ignore list, theme |
 
@@ -156,18 +158,133 @@ flowchart TD
 
 ## OWASP Payload Categories
 
-| Category | Payloads | Injection targets |
+| Category | File | Injection targets |
 |---|---|---|
-| **SQLi** | 30 | URL params, body, headers |
-| **XSS** | 30 | URL params, body, headers |
-| **CMDi** | 36 | URL params, body, headers |
-| **Path Traversal** | 30 | URL params, body, headers |
-| **SSRF** | 32 | URL params, body, headers |
-| **SSTI** | 30 | URL params, body, headers |
-| **Open Redirect** | 30 | URL params, body, headers |
-| **RCE** | 30 | URL params, body, headers |
+| **SQLi** | `sqli.json` | URL params, body, headers |
+| **XSS** | `xss.json` | URL params, body, headers |
+| **CMDi** | `cmdi.json` | URL params, body, headers |
+| **Path Traversal** | `path_traversal.json` | URL params, body, headers |
+| **SSRF** | `ssrf.json` | URL params, body, headers |
+| **SSTI** | `ssti.json` | URL params, body, headers |
+| **Open Redirect** | `open_redirect.json` | URL params, body, headers |
+| **RCE** | `rce.json` | URL params, body, headers |
+| **XXE** | `xxe.json` | URL params, body (XML endpoints) |
 
-Payloads are embedded at compile time from `payload/*.json`. Headers tested: `User-Agent`, `Referer`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Real-IP`, `X-Custom-IP-Authorization`, `X-Original-URL`, `Accept-Language`, `Origin`.
+Payloads are loaded at runtime from `payload/*.json` — add or edit any file to extend coverage. Headers tested by the crawler: `User-Agent`, `Referer`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Real-IP`, `X-Custom-IP-Authorization`, `X-Original-URL`, `Accept-Language`, `Origin`.
+
+---
+
+## OpenAPI Scanner
+
+The OpenAPI Scanner parses an OpenAPI 3.x or Swagger 2.x specification (JSON or YAML), enumerates every endpoint and parameter, and fuzzes them with all payload categories.
+
+### Scan behaviour
+
+- **All parameter locations** — query params, body fields (JSON / form), path params
+- **Early stop per endpoint** — once a vulnerability is confirmed on an endpoint, remaining payloads for that endpoint are skipped (no duplicate findings)
+- **Concurrent** — up to 8 endpoints scanned in parallel (configurable)
+- **Evidence-based** — a finding is only confirmed when the response contains payload-specific markers; HTTP 302 / 404 / 0 are treated as false positives
+
+### OpenAPI Scanner flow
+
+```mermaid
+flowchart TD
+    SPEC["OpenAPI / Swagger spec\n(.json or .yaml)"] --> PARSE["openapi::parse()"]
+    PARSE --> EPS["Vec<ApiEndpoint>\n(method, path, params)"]
+    EPS --> LOOP["For each endpoint\n(up to 8 concurrent)"]
+    LOOP --> PARAMS["For each parameter\n(body / query / path)"]
+    PARAMS --> CATS["For each payload category\n(sqli, xss, xxe, …)"]
+    CATS --> FUZZ["build_request_fuzzed()\nInject payload"]
+    FUZZ --> SEND["repeater_send()\nTCP / TLS"]
+    SEND --> CHECK["rapport::check_reflected()\nEvidence?"]
+    CHECK -->|"No"| CATS
+    CHECK -->|"Yes"| HIT["ScanResult{evidence}"]
+    HIT --> SKIP["Skip remaining payloads\nfor this endpoint"]
+    SKIP --> LOOP
+```
+
+---
+
+## CI/CD — Headless mode
+
+Rustman can run as a pure CLI scanner — no GUI, no proxy — for integration into automated pipelines.
+
+### Usage
+
+```bash
+# Basic scan — Markdown report on stdout
+cargo run -- --openapi spec.yaml --target http://staging-api:8080
+
+# Write a Markdown report (format inferred from extension)
+cargo run -- --openapi spec.yaml --target http://api --output report.md
+
+# JSON report for downstream parsing
+cargo run -- --openapi spec.yaml --target http://api --output report.json
+
+# Fail the pipeline if vulnerabilities are found
+cargo run -- --openapi spec.yaml --target http://api \
+  --output report.md --fail-on-vuln
+
+# With authentication
+cargo run -- --openapi spec.yaml --target http://api \
+  --bearer "$TOKEN" --fail-on-vuln
+
+# All options
+cargo run -- --openapi spec.yaml --target http://api \
+  --payload-dir ./payload \
+  --format json \
+  --output report.json \
+  --fail-on-vuln \
+  --concurrency 8 \
+  --bearer "$TOKEN" \
+  --cookie "session=abc123" \
+  --api-key-header X-Api-Key \
+  --api-key-value "$KEY"
+```
+
+### Options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--openapi <file>` | — | OpenAPI / Swagger spec (JSON or YAML) **required** |
+| `--target <url>` | spec `servers[0]` | Target base URL |
+| `--payload-dir <dir>` | `./payload` | Directory containing `*.json` payload files |
+| `--format <markdown\|json>` | inferred from `--output`, else `markdown` | Output format |
+| `--output <file>` | stdout | Write report to file |
+| `--fail-on-vuln` | off | Exit `1` when vulnerabilities are confirmed |
+| `--concurrency <n>` | `8` | Maximum parallel endpoint scans |
+| `--bearer <token>` | — | `Authorization: Bearer` header |
+| `--cookie <value>` | — | `Cookie` header |
+| `--api-key-header <name>` | — | Custom header name |
+| `--api-key-value <value>` | — | Custom header value |
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Clean — no vulnerabilities found |
+| `1` | Vulnerabilities confirmed (only with `--fail-on-vuln`) |
+| `2` | Usage / configuration error |
+| `3` | Scan error (bad spec, connection refused, …) |
+
+### GitHub Actions example
+
+```yaml
+- name: Security scan
+  run: |
+    cargo run -- \
+      --openapi docs/openapi.yaml \
+      --target ${{ env.STAGING_URL }} \
+      --output security-report.md \
+      --fail-on-vuln
+
+- name: Upload report
+  if: always()
+  uses: actions/upload-artifact@v4
+  with:
+    name: security-report
+    path: security-report.md
+```
 
 ---
 
@@ -188,35 +305,6 @@ sequenceDiagram
     SRV-->>RT: HTTP response
     RT->>GUI: tx.send(response bytes)
     GUI->>GUI: poll_repeater() → display response
-```
-
----
-
-## Claude AI — Direct API Flow
-
-```mermaid
-sequenceDiagram
-    participant U as User (Claude tab)
-    participant GUI as GUI
-    participant RT as bg_rt
-    participant ANT as Anthropic API
-    participant ST as AppState
-
-    U->>GUI: Type message + Send
-    GUI->>ST: push ChatMessage{from_user: true}
-    GUI->>RT: spawn claude_client::chat(api_key, mode, history)
-
-    loop Tool use rounds (max 10)
-        RT->>ANT: POST /v1/messages\n(messages, tools, system_prompt)
-        ANT-->>RT: {stop_reason: "tool_use", content: [...]}
-        RT->>ST: execute_tool(name, input)
-        Note over RT,ST: list_requests / get_requests\nforward_request / drop_request
-        RT->>ANT: POST /v1/messages (+ tool_result)
-    end
-
-    ANT-->>RT: {stop_reason: "end_turn"}
-    RT->>GUI: tx.send(Ok(text))
-    GUI->>ST: push ChatMessage{from_user: false}
 ```
 
 ---
@@ -332,9 +420,6 @@ Manually replay requests with custom edits. Multiple sessions, each with its own
 ### Crawler
 Recursive BFS crawler. Click any entry to see its request/response. When a page finishes loading, attack variants are generated in a background thread — click any variant to fire the request and see the real server response side by side.
 
-### Claude
-In-app AI assistant. Switch between **General** and **Pentest** modes. In Pentest mode every response follows the structured report format: Summary / Observations / Hypotheses / Validation / Impact / Remediation / Priority.
-
 ### Settings
 
 | Setting | Description |
@@ -355,7 +440,7 @@ In-app AI assistant. Switch between **General** and **Pentest** modes. In Pentes
 rustman/
 ├── build.rs             — Windows .exe icon embedding (winres + ico)
 ├── logo.png             — Application logo (embedded at compile time)
-├── payload/
+├── payload/             — Payload files loaded at runtime (add/edit freely)
 │   ├── sqli.json
 │   ├── xss.json
 │   ├── cmdi.json
@@ -363,13 +448,17 @@ rustman/
 │   ├── ssrf.json
 │   ├── ssti.json
 │   ├── open_redirect.json
-│   └── rce.json
+│   ├── rce.json
+│   └── xxe.json
 └── src/
-    ├── main.rs          — Entry point, proxy manager thread, MCP spawn
+    ├── main.rs          — Entry point: routes to CLI or GUI mode
+    ├── cli.rs           — Headless CLI scanner (CI/CD mode)
     ├── app.rs           — Shared state (AppState, Request, Settings)
     ├── proxy.rs         — MITM proxy, TLS interception, stoppable accept loop
     ├── ca.rs            — Dynamic certificate authority (rcgen)
-    ├── gui.rs           — egui/eframe UI (all tabs, adaptive repaint)
+    ├── gui.rs           — egui/eframe UI (all tabs, OpenAPI scanner UI)
+    ├── openapi.rs       — OpenAPI / Swagger parser, payload loader, request builder
+    ├── rapport.rs       — Evidence detection, false-positive filter, PDF/MD report gen
     ├── crawler.rs       — BFS crawler, OWASP attack generation
     ├── mcp.rs           — MCP HTTP server (tools + prompts)
     └── claude_client.rs — Anthropic API client with tool-use loop

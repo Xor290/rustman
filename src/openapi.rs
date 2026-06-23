@@ -13,15 +13,15 @@ pub enum ParamLoc {
 /// Résultat d'un test de payload sur un paramètre.
 #[derive(Debug, Clone)]
 pub struct ScanResult {
-    pub ep_idx:      usize,
-    pub param:       String,
-    pub loc:         ParamLoc,
-    pub category:    String,   // nom rapport : "SQLi", "XSS", etc.
-    pub payload:     String,
-    pub status:      u16,
-    pub response:    Vec<u8>,
-    pub evidence:    Option<String>, // Some(_) = vulnérabilité confirmée
-    pub raw_request: Vec<u8>,        // peuplé uniquement si evidence.is_some()
+    pub ep_idx: usize,
+    pub param: String,
+    pub loc: ParamLoc,
+    pub category: String, // nom rapport : "SQLi", "XSS", etc.
+    pub payload: String,
+    pub status: u16,
+    pub response: Vec<u8>,
+    pub evidence: Option<String>, // Some(_) = vulnérabilité confirmée
+    pub raw_request: Vec<u8>,     // peuplé uniquement si evidence.is_some()
 }
 
 /// Messages envoyés par le background scan task vers le GUI.
@@ -37,15 +37,16 @@ pub enum ScanMsg {
 /// Convertit le nom de fichier payload (ex: "sqli") vers le nom de catégorie rapport.
 pub fn payload_cat_name(stem: &str) -> &'static str {
     match stem {
-        "sqli"           => "SQLi",
-        "xss"            => "XSS",
-        "cmdi"           => "CMDi",
-        "rce"            => "RCE",
+        "sqli" => "SQLi",
+        "xss" => "XSS",
+        "cmdi" => "CMDi",
+        "rce" => "RCE",
         "path_traversal" => "PathTraversal",
-        "ssrf"           => "SSRF",
-        "ssti"           => "SSTI",
-        "open_redirect"  => "OpenRedirect",
-        _                => "Other",
+        "ssrf" => "SSRF",
+        "ssti" => "SSTI",
+        "open_redirect" => "OpenRedirect",
+        "xxe" => "XXE",
+        _ => "Other",
     }
 }
 
@@ -53,7 +54,9 @@ pub fn payload_cat_name(stem: &str) -> &'static str {
 /// Retourne Vec<(nom_catégorie, payloads)>.
 pub fn load_payloads(dir: &str) -> Vec<(String, Vec<String>)> {
     let mut result = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else { return result };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return result;
+    };
     let mut paths: Vec<_> = entries
         .flatten()
         .map(|e| e.path())
@@ -61,9 +64,15 @@ pub fn load_payloads(dir: &str) -> Vec<(String, Vec<String>)> {
         .collect();
     paths.sort();
     for path in paths {
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
-        let Ok(text) = std::fs::read_to_string(&path) else { continue };
-        let Ok(arr)  = serde_json::from_str::<Vec<String>>(&text) else { continue };
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(arr) = serde_json::from_str::<Vec<String>>(&text) else {
+            continue;
+        };
         if !arr.is_empty() {
             result.push((stem.to_string(), arr));
         }
@@ -124,7 +133,9 @@ impl ApiEndpoint {
         }
 
         let query = if !self.query_params.is_empty() {
-            let qs = self.query_params.iter()
+            let qs = self
+                .query_params
+                .iter()
                 .map(|p| format!("{p}=test"))
                 .collect::<Vec<_>>()
                 .join("&");
@@ -163,7 +174,9 @@ impl ApiEndpoint {
             .into_bytes()
         } else {
             let body = if !self.body_fields.is_empty() {
-                let fields: Vec<String> = self.body_fields.iter()
+                let fields: Vec<String> = self
+                    .body_fields
+                    .iter()
                     .map(|f| format!("\"{}\":\"test\"", f))
                     .collect();
                 format!("{{{}}}", fields.join(","))
@@ -218,7 +231,9 @@ impl ApiEndpoint {
 
         // Query string : injecte les params du spec + tout param hors-spec fuzzé.
         let query = {
-            let mut parts: Vec<String> = self.query_params.iter()
+            let mut parts: Vec<String> = self
+                .query_params
+                .iter()
                 .map(|p| {
                     let val = if *fuzz_loc == ParamLoc::Query && p == fuzz_param {
                         urlencoded(payload)
@@ -229,12 +244,14 @@ impl ApiEndpoint {
                 })
                 .collect();
             // Param hors-spec (fallback no-param endpoint) : on l'ajoute quand même.
-            if *fuzz_loc == ParamLoc::Query
-                && !self.query_params.iter().any(|q| q == fuzz_param)
-            {
+            if *fuzz_loc == ParamLoc::Query && !self.query_params.iter().any(|q| q == fuzz_param) {
                 parts.push(format!("{}={}", fuzz_param, urlencoded(payload)));
             }
-            if parts.is_empty() { String::new() } else { format!("?{}", parts.join("&")) }
+            if parts.is_empty() {
+                String::new()
+            } else {
+                format!("?{}", parts.join("&"))
+            }
         };
 
         let full_path = format!("{clean}{query}");
@@ -244,10 +261,16 @@ impl ApiEndpoint {
         };
         let host_hdr = format!("{host}{port_sfx}");
 
-        let cookie_line = if cookie_hdr.is_empty() { String::new() }
-            else { format!("Cookie: {cookie_hdr}\r\n") };
-        let auth_line = if bearer.is_empty() { String::new() }
-            else { format!("Authorization: Bearer {bearer}\r\n") };
+        let cookie_line = if cookie_hdr.is_empty() {
+            String::new()
+        } else {
+            format!("Cookie: {cookie_hdr}\r\n")
+        };
+        let auth_line = if bearer.is_empty() {
+            String::new()
+        } else {
+            format!("Authorization: Bearer {bearer}\r\n")
+        };
         let api_key_line = if !api_key_header.is_empty() && !api_key_value.is_empty() {
             format!("{api_key_header}: {api_key_value}\r\n")
         } else {
@@ -260,10 +283,13 @@ impl ApiEndpoint {
             ).into_bytes()
         } else {
             let body = if !self.body_fields.is_empty() {
-                let fields: Vec<String> = self.body_fields.iter()
+                let fields: Vec<String> = self
+                    .body_fields
+                    .iter()
                     .map(|f| {
                         let val = if *fuzz_loc == ParamLoc::Body && f == fuzz_param {
-                            serde_json::to_string(payload).unwrap_or_else(|_| format!("\"{}\"", payload))
+                            serde_json::to_string(payload)
+                                .unwrap_or_else(|_| format!("\"{}\"", payload))
                         } else {
                             "\"test\"".to_string()
                         };
@@ -293,8 +319,9 @@ fn urlencoded(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 3);
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
-            | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{:02X}", b)),
         }
     }
@@ -305,7 +332,7 @@ fn urlencoded(s: &str) -> String {
 
 /// Résultat du parsing d'un spec OpenAPI.
 pub struct ParseResult {
-    pub endpoints:  Vec<ApiEndpoint>,
+    pub endpoints: Vec<ApiEndpoint>,
     pub credentials: Option<Credentials>,
     /// Première URL de la liste `servers` (base URL de l'API).
     pub server_url: Option<String>,
@@ -315,7 +342,7 @@ pub struct ParseResult {
 pub fn parse(text: &str) -> Result<ParseResult, String> {
     let v = parse_to_json_value(text.trim())?;
     let credentials = extract_credentials(&v);
-    let server_url  = extract_server_url(&v);
+    let server_url = extract_server_url(&v);
     let endpoints = if v.get("openapi").is_some() {
         parse_openapi3(&v)?
     } else if v.get("swagger").is_some() {
@@ -323,7 +350,11 @@ pub fn parse(text: &str) -> Result<ParseResult, String> {
     } else {
         return Err("Document non reconnu : aucun champ 'openapi' ou 'swagger' trouvé".into());
     };
-    Ok(ParseResult { endpoints, credentials, server_url })
+    Ok(ParseResult {
+        endpoints,
+        credentials,
+        server_url,
+    })
 }
 
 // ── Parsing JSON / YAML ───────────────────────────────────────────────────────
@@ -332,12 +363,10 @@ fn parse_to_json_value(text: &str) -> Result<Value, String> {
     // Heuristique : si le texte commence par { ou [, c'est du JSON
     let first = text.chars().find(|c| !c.is_whitespace());
     if matches!(first, Some('{') | Some('[')) {
-        return serde_json::from_str(text)
-            .map_err(|e| format!("JSON invalide : {e}"));
+        return serde_json::from_str(text).map_err(|e| format!("JSON invalide : {e}"));
     }
     // Sinon on essaie YAML (OpenAPI YAML commence généralement par "openapi:")
-    serde_yaml::from_str::<Value>(text)
-        .map_err(|e| format!("YAML invalide : {e}"))
+    serde_yaml::from_str::<Value>(text).map_err(|e| format!("YAML invalide : {e}"))
 }
 
 // ── Extraction des credentials ────────────────────────────────────────────────
@@ -356,21 +385,28 @@ fn extract_credentials(v: &Value) -> Option<Credentials> {
     let xc = v.get("x-credentials")?;
 
     let get = |k: &str| -> Option<String> {
-        xc.get(k)?.as_str().filter(|s| !s.is_empty()).map(str::to_string)
+        xc.get(k)?
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
     };
 
     let c = Credentials {
-        bearer:         get("bearer"),
-        cookie:         get("cookie"),
-        username:       get("username"),
-        password:       get("password"),
+        bearer: get("bearer"),
+        cookie: get("cookie"),
+        username: get("username"),
+        password: get("password"),
         api_key_header: get("api_key_header"),
-        api_key_value:  get("api_key_value"),
+        api_key_value: get("api_key_value"),
     };
 
     // Retourne None si aucun champ n'est renseigné
-    if c.bearer.is_none() && c.cookie.is_none() && c.username.is_none()
-        && c.password.is_none() && c.api_key_header.is_none() && c.api_key_value.is_none()
+    if c.bearer.is_none()
+        && c.cookie.is_none()
+        && c.username.is_none()
+        && c.password.is_none()
+        && c.api_key_header.is_none()
+        && c.api_key_value.is_none()
     {
         return None;
     }
@@ -385,7 +421,9 @@ fn parse_openapi3(v: &Value) -> Result<Vec<ApiEndpoint>, String> {
     let mut endpoints = Vec::new();
 
     for (path, path_val) in paths_obj {
-        let Some(path_obj) = path_val.as_object() else { continue };
+        let Some(path_obj) = path_val.as_object() else {
+            continue;
+        };
 
         // Parameters defined at the path level (shared by all operations)
         let path_level: Vec<&Value> = path_obj
@@ -395,7 +433,9 @@ fn parse_openapi3(v: &Value) -> Result<Vec<ApiEndpoint>, String> {
             .unwrap_or_default();
 
         for (method, op) in path_obj {
-            if !is_http_method(method) { continue; }
+            if !is_http_method(method) {
+                continue;
+            }
 
             // Operation-level parameters override path-level ones with same name+in
             let op_level: Vec<&Value> = op
@@ -408,25 +448,29 @@ fn parse_openapi3(v: &Value) -> Result<Vec<ApiEndpoint>, String> {
             // Start with path-level, skip any overridden by op-level
             for p in &path_level {
                 let name = p.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                let loc  = p.get("in").and_then(|i| i.as_str()).unwrap_or("");
+                let loc = p.get("in").and_then(|i| i.as_str()).unwrap_or("");
                 let overridden = op_level.iter().any(|q| {
                     q.get("name").and_then(|n| n.as_str()).unwrap_or("") == name
-                    && q.get("in").and_then(|i| i.as_str()).unwrap_or("") == loc
+                        && q.get("in").and_then(|i| i.as_str()).unwrap_or("") == loc
                 });
-                if !overridden { merged.push(p); }
+                if !overridden {
+                    merged.push(p);
+                }
             }
             merged.extend_from_slice(&op_level);
 
             let mut query_params = Vec::new();
-            let mut path_params  = Vec::new();
+            let mut path_params = Vec::new();
 
             for param in &merged {
-                let loc  = param.get("in").and_then(|i| i.as_str()).unwrap_or("");
+                let loc = param.get("in").and_then(|i| i.as_str()).unwrap_or("");
                 let name = param.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                if name.is_empty() { continue; }
+                if name.is_empty() {
+                    continue;
+                }
                 match loc {
                     "query" => query_params.push(name.to_string()),
-                    "path"  => path_params.push(name.to_string()),
+                    "path" => path_params.push(name.to_string()),
                     _ => {}
                 }
             }
@@ -438,9 +482,11 @@ fn parse_openapi3(v: &Value) -> Result<Vec<ApiEndpoint>, String> {
                 let schema = content
                     .and_then(|c| c.get("application/json"))
                     .and_then(|j| j.get("schema"))
-                    .or_else(|| content
-                        .and_then(|c| c.get("application/x-www-form-urlencoded"))
-                        .and_then(|j| j.get("schema")));
+                    .or_else(|| {
+                        content
+                            .and_then(|c| c.get("application/x-www-form-urlencoded"))
+                            .and_then(|j| j.get("schema"))
+                    });
                 if let Some(s) = schema {
                     body_fields = extract_schema_fields(v, s);
                 }
@@ -469,15 +515,19 @@ fn parse_swagger2(v: &Value) -> Result<Vec<ApiEndpoint>, String> {
     let mut endpoints = Vec::new();
 
     for (path, methods_val) in paths_obj {
-        let Some(methods) = methods_val.as_object() else { continue };
+        let Some(methods) = methods_val.as_object() else {
+            continue;
+        };
         for (method, op) in methods {
-            if !is_http_method(method) { continue; }
+            if !is_http_method(method) {
+                continue;
+            }
             let mut query_params = Vec::new();
-            let mut body_fields  = Vec::new();
+            let mut body_fields = Vec::new();
 
             if let Some(arr) = op.get("parameters").and_then(|p| p.as_array()) {
                 for param in arr {
-                    let loc  = param.get("in").and_then(|i| i.as_str()).unwrap_or("");
+                    let loc = param.get("in").and_then(|i| i.as_str()).unwrap_or("");
                     let name = param.get("name").and_then(|n| n.as_str()).unwrap_or("");
                     match loc {
                         "query" if !name.is_empty() => query_params.push(name.to_string()),
@@ -540,7 +590,8 @@ fn extract_schema_fields(doc: &Value, schema: &Value) -> Vec<String> {
     // allOf / oneOf / anyOf — union of all sub-schema fields
     for key in &["allOf", "oneOf", "anyOf"] {
         if let Some(arr) = schema.get(key).and_then(|a| a.as_array()) {
-            let mut fields: Vec<String> = arr.iter()
+            let mut fields: Vec<String> = arr
+                .iter()
                 .flat_map(|sub| extract_schema_fields(doc, sub))
                 .collect();
             fields.sort_unstable();
@@ -558,7 +609,9 @@ fn extract_schema_fields(doc: &Value, schema: &Value) -> Vec<String> {
     if schema.get("additionalProperties").and_then(|a| a.as_bool()) == Some(true) {
         if let Some(ex) = schema.get("example").and_then(|e| e.as_object()) {
             let keys: Vec<String> = ex.keys().cloned().collect();
-            if !keys.is_empty() { return keys; }
+            if !keys.is_empty() {
+                return keys;
+            }
         }
         return vec!["value".to_string()];
     }

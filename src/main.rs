@@ -1,5 +1,6 @@
 mod app;
 mod ca;
+mod cli;
 mod claude_client;
 mod crawler;
 mod gui;
@@ -11,6 +12,24 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 fn main() {
+    // ── CI/CD headless mode ───────────────────────────────────────────────────
+    if std::env::args().any(|a| a == "--help" || a == "-h")
+        && !std::env::args().any(|a| a == "--scan" || a == "--openapi")
+    {
+        cli::print_usage();
+        std::process::exit(0);
+    }
+
+    if let Some(args) = cli::parse_args() {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .expect("failed to install ring crypto provider");
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let code = rt.block_on(cli::run(args));
+        std::process::exit(code);
+    }
+
+    // ── GUI mode ──────────────────────────────────────────────────────────────
     unsafe {
         let v = std::env::var("LIBGL_ALWAYS_SOFTWARE").unwrap_or_default();
         if v.is_empty() || v == "0" {
