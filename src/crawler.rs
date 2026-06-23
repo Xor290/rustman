@@ -40,6 +40,14 @@ pub enum CrawlMsg {
         cookie: String,
         bearer: Option<String>,
     },
+    /// Sent for each form that was filled and submitted — carries the POST request
+    /// bytes so the GUI can queue them for body-parameter attack generation.
+    FormSubmit {
+        action_url: String,
+        request:    Vec<u8>,
+        status:     u16,
+        response:   Vec<u8>,
+    },
     Finished,
     Attack {
         variant: Vec<AttackVariant>,
@@ -116,9 +124,62 @@ pub async fn run(
         .as_secs();
     let reg_email = format!("rustman_{ts}@test.local");
     let reg_password = "Rustman@Test123!".to_string();
+    // Track form actions already submitted to avoid repeating the same submission.
+    let mut visited_forms: HashSet<String> = HashSet::new();
 
     visited.insert(canonical(&start_url));
     queue.push_back((start_url, 0));
+
+    // ── Early auth: try to get credentials before crawling ───────────────────
+    if !logged_in {
+        if let Some(ref auth) = config.auth {
+            if !auth.username.is_empty() {
+                // Try JSON login with provided credentials against all known login paths.
+                if let Some((cookies, bearer)) =
+                    try_json_login(&base_host, base_port, base_tls, &auth.username, &auth.password).await
+                {
+                    logged_in = true;
+                    upsert_cookies(&mut session_cookies, cookies);
+                    auth_bearer = bearer.clone();
+                    let _ = tx.send(CrawlMsg::LoggedIn {
+                        cookie: make_cookie_header(&session_cookies),
+                        bearer,
+                    });
+                }
+            }
+        }
+    }
+
+    // ── Early registration probe: create an account before the crawl begins ──
+    if !logged_in && !registered {
+        const EARLY_REG_PATHS: &[&str] = &[
+            "/api/Users",
+            "/api/users",
+            "/api/register",
+            "/api/signup",
+            "/auth/register",
+            "/register",
+            "/signup",
+            "/api/v1/users",
+        ];
+        'early_reg: for &rp in EARLY_REG_PATHS {
+            if try_json_register(&base_host, base_port, base_tls, rp, &reg_email, &reg_password).await {
+                registered = true;
+                if let Some((cookies, bearer)) =
+                    try_json_login(&base_host, base_port, base_tls, &reg_email, &reg_password).await
+                {
+                    logged_in = true;
+                    upsert_cookies(&mut session_cookies, cookies);
+                    auth_bearer = bearer.clone();
+                    let _ = tx.send(CrawlMsg::LoggedIn {
+                        cookie: make_cookie_header(&session_cookies),
+                        bearer,
+                    });
+                }
+                break 'early_reg;
+            }
+        }
+    }
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -189,7 +250,7 @@ pub async fn run(
             if let Some(ref auth) = config.auth {
                 if !auth.username.is_empty() {
                     if let Some(form) = detect_login_form(&body, &path, auth) {
-                        logged_in = true; // attempt only once regardless of outcome
+                        logged_in = true;
                         let mut fields: Vec<(String, String)> = vec![
                             (form.username_field.clone(), auth.username.clone()),
                             (form.password_field.clone(), auth.password.clone()),
@@ -215,13 +276,7 @@ pub async fn run(
                             let login_resp = crate::proxy::repeater_send(&lh, lp, lt, login_req).await;
                             let new_cookies = extract_set_cookies(&login_resp);
                             if !new_cookies.is_empty() {
-                                for (k, v) in new_cookies {
-                                    if let Some(e) = session_cookies.iter_mut().find(|(n, _)| n == &k) {
-                                        e.1 = v;
-                                    } else {
-                                        session_cookies.push((k, v));
-                                    }
-                                }
+                                upsert_cookies(&mut session_cookies, new_cookies);
                                 let cookie_str = make_cookie_header(&session_cookies);
                                 let _ = tx.send(CrawlMsg::LoggedIn { cookie: cookie_str, bearer: None });
                                 for item in retry_after_auth.drain(..) {
@@ -234,6 +289,26 @@ pub async fn run(
             }
         }
 
+        // ── Auto JSON-login: when visiting a recognised login endpoint ────────
+        if !logged_in && is_login_url(&url) {
+            let (email, pass) = match &config.auth {
+                Some(a) if !a.username.is_empty() => (a.username.clone(), a.password.clone()),
+                _ => (reg_email.clone(), reg_password.clone()),
+            };
+            if let Some((cookies, bearer)) =
+                try_json_login(&host, port, tls, &email, &pass).await
+            {
+                logged_in = true;
+                upsert_cookies(&mut session_cookies, cookies);
+                auth_bearer = bearer.clone();
+                let cookie_str = make_cookie_header(&session_cookies);
+                let _ = tx.send(CrawlMsg::LoggedIn { cookie: cookie_str, bearer });
+                for item in retry_after_auth.drain(..) {
+                    queue.push_front(item);
+                }
+            }
+        }
+
         // ── Auto-register: JSON registration when URL matches a signup pattern ──
         if !registered && is_registration_url(&url) {
             if try_json_register(&host, port, tls, &path, &reg_email, &reg_password).await {
@@ -241,17 +316,10 @@ pub async fn run(
                 if let Some((new_cookies, bearer)) =
                     try_json_login(&host, port, tls, &reg_email, &reg_password).await
                 {
-                    for (k, v) in new_cookies {
-                        if let Some(e) = session_cookies.iter_mut().find(|(n, _)| n == &k) {
-                            e.1 = v;
-                        } else {
-                            session_cookies.push((k, v));
-                        }
-                    }
+                    upsert_cookies(&mut session_cookies, new_cookies);
                     auth_bearer = bearer.clone();
                     let cookie_str = make_cookie_header(&session_cookies);
                     let _ = tx.send(CrawlMsg::LoggedIn { cookie: cookie_str, bearer });
-                    // Re-queue all URLs that failed with 401 — now we have credentials.
                     for item in retry_after_auth.drain(..) {
                         queue.push_front(item);
                     }
@@ -300,11 +368,102 @@ pub async fn run(
         };
 
         let _ = tx.send(CrawlMsg::Done {
-            url,
+            url: url.clone(),
             status,
             new_links,
             response: resp,
         });
+
+        // ── Form submission: fill and submit all HTML forms found on the page ──
+        // Only for successful HTML pages within crawl depth.
+        if status == 200 && depth < max_depth {
+            let forms = extract_all_forms(&body, &path);
+            for form in forms {
+                let Some((fh, fp, ft, fpath)) =
+                    resolve_form_action(&form.action, &base_host, base_tls, base_port, &path)
+                else {
+                    continue;
+                };
+                // Only submit forms that target the same host.
+                if !fh.eq_ignore_ascii_case(&base_host) {
+                    continue;
+                }
+                // Deduplicate: skip this form action if already submitted.
+                let form_key = format!("{}|{}|{}", form.method, fh, fpath);
+                if visited_forms.contains(&form_key) {
+                    continue;
+                }
+                visited_forms.insert(form_key);
+
+                // Fill each field with a test value.
+                let filled: Vec<(String, String)> = form.fields.iter()
+                    .map(|(name, itype, val)| {
+                        let v = if !val.is_empty() {
+                            val.clone()
+                        } else {
+                            default_field_value(name, itype)
+                        };
+                        (name.clone(), v)
+                    })
+                    .collect();
+                if filled.is_empty() {
+                    continue;
+                }
+
+                let proto_f = if ft { "https" } else { "http" };
+                let port_sfx_f = match (ft, fp) {
+                    (true, 443) | (false, 80) => String::new(),
+                    _ => format!(":{fp}"),
+                };
+                let cookie_hdr_f = make_cookie_header(&session_cookies);
+                let cookie_line_f = if cookie_hdr_f.is_empty() {
+                    String::new()
+                } else {
+                    format!("Cookie: {cookie_hdr_f}\r\n")
+                };
+                let auth_line_f = match &auth_bearer {
+                    Some(t) if !t.is_empty() => format!("Authorization: Bearer {t}\r\n"),
+                    _ => String::new(),
+                };
+                let method_uc = form.method.to_uppercase();
+
+                let (action_url, form_req_bytes) = if method_uc == "GET" {
+                    let qs: String = filled.iter()
+                        .map(|(k, v)| format!("{}={}", url_encode_form(k), url_encode_form(v)))
+                        .collect::<Vec<_>>()
+                        .join("&");
+                    let get_path = format!("{fpath}?{qs}");
+                    let action_url = format!("{proto_f}://{fh}{port_sfx_f}{get_path}");
+                    let req = format!(
+                        "GET {get_path} HTTP/1.1\r\nHost: {fh}\r\nUser-Agent: rustman-crawler/1.0\r\nAccept: text/html,*/*;q=0.9\r\n{cookie_line_f}{auth_line_f}Connection: close\r\n\r\n"
+                    )
+                    .into_bytes();
+                    (action_url, req)
+                } else {
+                    let form_body: String = filled.iter()
+                        .map(|(k, v)| format!("{}={}", url_encode_form(k), url_encode_form(v)))
+                        .collect::<Vec<_>>()
+                        .join("&");
+                    let fbl = form_body.len();
+                    let action_url = format!("{proto_f}://{fh}{port_sfx_f}{fpath}");
+                    let req = format!(
+                        "POST {fpath} HTTP/1.1\r\nHost: {fh}\r\nUser-Agent: rustman-crawler/1.0\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {fbl}\r\n{cookie_line_f}{auth_line_f}Connection: close\r\n\r\n{form_body}"
+                    )
+                    .into_bytes();
+                    (action_url, req)
+                };
+
+                let form_resp = crate::proxy::repeater_send(&fh, fp, ft, form_req_bytes.clone()).await;
+                let (form_status, _) = split_response(&form_resp);
+
+                let _ = tx.send(CrawlMsg::FormSubmit {
+                    action_url,
+                    request: form_req_bytes,
+                    status: form_status,
+                    response: form_resp,
+                });
+            }
+        }
     }
 
     let _ = tx.send(CrawlMsg::Finished);
@@ -789,6 +948,16 @@ fn enqueue_js_routes(
                 }
             }
             route
+        } else if route.starts_with("//") {
+            // Protocol-relative URL (e.g. "//cdn.example.com/...") — resolve with
+            // the target's scheme and check the host.
+            let with_proto = format!("{proto}:{route}");
+            if let Some((rh, _, _, _)) = parse_url_parts(&with_proto) {
+                if !rh.eq_ignore_ascii_case(base_host) && !is_ip_host(&rh) {
+                    continue; // External host → discard
+                }
+            }
+            with_proto
         } else {
             format!("{proto}://{base_host}{port_sfx}{route}")
         };
@@ -1010,8 +1179,22 @@ fn looks_like_api_path(s: &str) -> bool {
     if !s.starts_with('/') && !s.starts_with("http://") && !s.starts_with("https://") {
         return false;
     }
+    // Reject protocol-relative URLs — handled separately in enqueue_js_routes.
+    if s.starts_with("//") { return false; }
     // Reject template expressions
     if s.contains("${") { return false; }
+    // Reject paths whose first segment looks like an external hostname.
+    // E.g. "/api.ipinfodb.com/v3/..." comes from "//api.ipinfodb.com/..." in JS.
+    if s.starts_with('/') {
+        let first_seg = s[1..].split('/').next().unwrap_or("").to_ascii_lowercase();
+        // A segment like "api.ipinfodb.com" has a dot followed by 2+ alpha chars (TLD).
+        if first_seg.len() > 3 && first_seg.contains('.') {
+            let after_last_dot = first_seg.rsplit('.').next().unwrap_or("");
+            if after_last_dot.len() >= 2 && after_last_dot.chars().all(|c| c.is_ascii_alphabetic()) {
+                return false;
+            }
+        }
+    }
     // Reject static asset extensions
     let lower = s.split('?').next().unwrap_or(s).to_ascii_lowercase();
     const SKIP: &[&str] = &[
@@ -1146,8 +1329,10 @@ fn get_payloads() -> &'static Vec<(String, String)> {
 pub fn attack_request(url: &str, raw: &[u8]) -> Vec<AttackVariant> {
     let mut out = Vec::new();
     out.extend(attack_url_params(url, raw));
+    out.extend(attack_fuzz_params(url, raw));
     out.extend(attack_headers(url, raw));
     out.extend(attack_body_params(url, raw));
+    out.extend(attack_json_body(url, raw));
     out
 }
 
@@ -1307,6 +1492,107 @@ fn attack_body_params(url: &str, raw: &[u8]) -> Vec<AttackVariant> {
     out
 }
 
+/// Inject payloads as new query parameters on API-like URLs that have no existing params.
+/// Covers the common case where the crawler finds routes like `/rest/products/search`
+/// without any `?q=…` — Juice Shop's SQLi lives exactly there.
+fn attack_fuzz_params(url: &str, raw: &[u8]) -> Vec<AttackVariant> {
+    // Only fuzz URLs that have no existing query params (attack_url_params handles those).
+    if url.contains('?') {
+        return vec![];
+    }
+
+    let path_lc = url.to_ascii_lowercase();
+    const API_INDICATORS: &[&str] = &[
+        "/api/", "/rest/", "/v1/", "/v2/", "/v3/",
+        "/graphql", "/gql",
+        "/search", "/query", "/filter",
+        "/products", "/product",
+        "/users", "/user",
+        "/account", "/accounts",
+        "/admin", "/dashboard", "/profile",
+        "/login", "/register", "/signup",
+        "/items", "/item", "/orders", "/order",
+        "/reviews", "/review", "/feedback",
+    ];
+    if !API_INDICATORS.iter().any(|p| path_lc.contains(p)) {
+        return vec![];
+    }
+
+    // Common injectable parameter names.
+    const FUZZ_PARAMS: &[&str] = &[
+        "q", "search", "query", "id", "name", "email",
+        "username", "redirect", "url", "next",
+        "file", "path", "category",
+    ];
+
+    let payloads = get_payloads();
+    let mut out = Vec::new();
+
+    for param in FUZZ_PARAMS {
+        for (category, payload) in payloads {
+            let new_url = format!("{}?{}={}", url, param, url_encode(payload));
+            let new_raw = replace_url_in_request(raw, url, &new_url);
+            out.push(AttackVariant {
+                url:         new_url,
+                raw_request: new_raw,
+                target:      AttackTarget::UrlParam(param.to_string()),
+                category:    category.clone(),
+                payload:     payload.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// Inject payloads into JSON POST body fields for REST API endpoints.
+/// Juice Shop (and most modern SPAs) use JSON bodies, not form-urlencoded.
+fn attack_json_body(url: &str, _raw: &[u8]) -> Vec<AttackVariant> {
+    let path_lc = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
+    const API_INDICATORS: &[&str] = &[
+        "/api/", "/rest/", "/v1/", "/v2/",
+        "/login", "/register", "/signup", "/auth",
+        "/users", "/user", "/account",
+        "/search", "/graphql",
+        "/feedback", "/reviews",
+    ];
+    if !API_INDICATORS.iter().any(|p| path_lc.contains(p)) {
+        return vec![];
+    }
+
+    let Some((host, _port, _tls, path)) = parse_url_parts(url) else {
+        return vec![];
+    };
+
+    const JSON_FIELDS: &[&str] = &[
+        "email", "username", "password", "name",
+        "q", "search", "query", "id",
+        "url", "redirect", "path", "file", "comment",
+    ];
+
+    let payloads = get_payloads();
+    let mut out = Vec::new();
+
+    for field in JSON_FIELDS {
+        for (category, payload) in payloads {
+            let json_escaped = payload.replace('\\', "\\\\").replace('"', "\\\"");
+            let body = format!(r#"{{"{field}":"{json_escaped}"}}"#);
+            let body_len = body.len();
+            let raw_req = format!(
+                "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {body_len}\r\nAccept: application/json\r\nConnection: close\r\n\r\n{body}"
+            )
+            .into_bytes();
+            out.push(AttackVariant {
+                url:         url.to_string(),
+                raw_request: raw_req,
+                target:      AttackTarget::BodyParam(format!("json:{field}")),
+                category:    category.clone(),
+                payload:     payload.clone(),
+            });
+        }
+    }
+    out
+}
+
 // ── Request surgery helpers ───────────────────────────────────────────────────
 
 fn parse_kv<'a>(s: &'a str) -> Vec<(&'a str, &'a str)> {
@@ -1322,18 +1608,16 @@ fn parse_kv<'a>(s: &'a str) -> Vec<(&'a str, &'a str)> {
 
 /// Swap the URL in the request-line (first line) of a raw HTTP request.
 fn replace_url_in_request(raw: &[u8], _old_url: &str, new_url: &str) -> Vec<u8> {
+    // Use parse_url_parts to correctly extract only the path+query component,
+    // avoiding the old splitn(3, '/') bug that included the host in the path.
+    let path = parse_url_parts(new_url)
+        .map(|(_, _, _, p)| p)
+        .unwrap_or_else(|| "/".to_string());
+
     if raw.is_empty() {
-        // No existing raw — build a minimal GET request.
-        return format!("GET {new_url} HTTP/1.1\r\nConnection: close\r\n\r\n").into_bytes();
+        return format!("GET {path} HTTP/1.1\r\nConnection: close\r\n\r\n").into_bytes();
     }
     let src = String::from_utf8_lossy(raw);
-    // Extract just the path+query from the new URL.
-    let path = new_url
-        .splitn(3, '/')
-        .skip(2)
-        .next()
-        .map(|s| format!("/{s}"))
-        .unwrap_or_else(|| "/".to_string());
 
     // Replace only the path portion in the request-line.
     if let Some(first_end) = src.find("\r\n").or_else(|| src.find('\n')) {
@@ -1440,6 +1724,140 @@ fn is_registration_url(url: &str) -> bool {
     PATTERNS.iter().any(|p| path.ends_with(p))
 }
 
+fn is_login_url(url: &str) -> bool {
+    let path = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
+    let path = path.trim_end_matches('/');
+    const PATTERNS: &[&str] = &[
+        "/login", "/signin", "/sign-in",
+        "/auth/login", "/auth/signin", "/auth/token",
+        "/api/login", "/api/signin",
+        "/api/auth/login", "/api/auth/token", "/api/auth",
+        "/api/sessions", "/api/token",
+        "/rest/user/login",
+        "/oauth/token",
+        "/users/login", "/user/login",
+        "/account/login", "/accounts/login",
+        "/session/new",
+    ];
+    PATTERNS.iter().any(|p| path.ends_with(p))
+}
+
+/// Merge incoming cookies into the session, replacing existing values for the same name.
+fn upsert_cookies(session: &mut Vec<(String, String)>, incoming: Vec<(String, String)>) {
+    for (k, v) in incoming {
+        if let Some(e) = session.iter_mut().find(|(n, _)| n == &k) {
+            e.1 = v;
+        } else {
+            session.push((k, v));
+        }
+    }
+}
+
+// ── HTML form extraction for body-parameter discovery ─────────────────────────
+
+struct FormDef {
+    action: String,
+    method: String,
+    /// (field_name, input_type, default_value)
+    fields: Vec<(String, String, String)>,
+}
+
+/// Extract all `<form>` elements from an HTML page.
+fn extract_all_forms(html: &str, current_path: &str) -> Vec<FormDef> {
+    let lc = html.to_ascii_lowercase();
+    let mut forms = Vec::new();
+    let mut pos = 0;
+
+    while let Some(rel) = lc[pos..].find("<form") {
+        let form_start = pos + rel;
+        let Some(gt_rel) = lc[form_start..].find('>') else { break };
+        let tag_end = form_start + gt_rel + 1;
+        let form_tag = &html[form_start..tag_end];
+        let action = extract_attr_value(form_tag, "action")
+            .unwrap_or_else(|| current_path.to_string());
+        let method = extract_attr_value(form_tag, "method")
+            .unwrap_or_else(|| "post".to_string())
+            .to_ascii_lowercase();
+
+        let body_end = lc[tag_end..]
+            .find("</form>")
+            .map(|p| tag_end + p)
+            .unwrap_or(html.len());
+        let form_body     = &html[tag_end..body_end];
+        let form_body_lc  = form_body.to_ascii_lowercase();
+
+        let mut fields: Vec<(String, String, String)> = Vec::new();
+        let mut ipos = 0;
+        while let Some(rel) = form_body_lc[ipos..].find("<input") {
+            let abs      = ipos + rel;
+            let end_rel  = form_body_lc[abs..].find('>').unwrap_or(form_body.len() - abs);
+            let tag_abs  = (abs + end_rel + 1).min(form_body.len());
+            let tag      = &form_body[abs..tag_abs];
+            let itype    = extract_attr_value(tag, "type")
+                .unwrap_or_else(|| "text".to_string())
+                .to_ascii_lowercase();
+            let iname  = extract_attr_value(tag, "name").unwrap_or_default();
+            let ivalue = extract_attr_value(tag, "value").unwrap_or_default();
+            if !iname.is_empty()
+                && !matches!(itype.as_str(), "submit" | "button" | "image" | "reset" | "file")
+            {
+                fields.push((iname, itype, ivalue));
+            }
+            ipos = tag_abs;
+            if ipos == 0 { break; }
+        }
+        // Also collect <textarea> names.
+        let mut tpos = 0;
+        while let Some(rel) = form_body_lc[tpos..].find("<textarea") {
+            let abs     = tpos + rel;
+            let end_rel = form_body_lc[abs..].find('>').unwrap_or(form_body.len() - abs);
+            let tag_abs = (abs + end_rel + 1).min(form_body.len());
+            let tag     = &form_body[abs..tag_abs];
+            let tname   = extract_attr_value(tag, "name").unwrap_or_default();
+            if !tname.is_empty() {
+                fields.push((tname, "textarea".to_string(), String::new()));
+            }
+            tpos = tag_abs;
+            if tpos == 0 { break; }
+        }
+
+        if !fields.is_empty() {
+            forms.push(FormDef { action, method, fields });
+        }
+        pos = body_end + 7;
+    }
+    forms
+}
+
+/// Return a sensible test value for a form field based on its name and input type.
+fn default_field_value(name: &str, itype: &str) -> String {
+    let name_lc = name.to_ascii_lowercase();
+    match itype {
+        "email"         => return "test@test.local".to_string(),
+        "password"      => return "Test123!".to_string(),
+        "number"
+        | "range"       => return "1".to_string(),
+        "tel"           => return "0000000000".to_string(),
+        "url"           => return "http://test.local".to_string(),
+        "date"          => return "2024-01-01".to_string(),
+        "checkbox"
+        | "radio"       => return "1".to_string(),
+        _               => {}
+    }
+    if name_lc.contains("email")                               { "test@test.local".to_string() }
+    else if name_lc.contains("pass")                           { "Test123!".to_string() }
+    else if name_lc.contains("phone") || name_lc.contains("tel") { "0000000000".to_string() }
+    else if name_lc.contains("url")  || name_lc.contains("link") { "http://test.local".to_string() }
+    else if name_lc.contains("age")  || name_lc.contains("num")
+         || name_lc.contains("qty")  || name_lc.contains("count") { "1".to_string() }
+    else if name_lc.contains("zip")  || name_lc.contains("postal") { "00000".to_string() }
+    else if name_lc.contains("city") || name_lc.contains("country") { "test".to_string() }
+    else if name_lc.contains("name")                           { "Test User".to_string() }
+    else if name_lc.contains("comment") || name_lc.contains("message")
+         || name_lc.contains("body")    || name_lc.contains("text") { "test comment".to_string() }
+    else                                                       { "test".to_string() }
+}
+
 async fn try_json_register(
     host: &str,
     port: u16,
@@ -1449,6 +1867,8 @@ async fn try_json_register(
     password: &str,
 ) -> bool {
     let bodies = [
+        // Juice Shop: requires passwordRepeat + optional security question
+        format!(r#"{{"email":"{email}","password":"{password}","passwordRepeat":"{password}","securityQuestion":{{"id":1,"question":"Your eldest siblings middle name?","createdAt":"2024-01-01T00:00:00.000Z","updatedAt":"2024-01-01T00:00:00.000Z"}},"securityAnswer":"test"}}"#),
         format!(r#"{{"email":"{email}","password":"{password}","passwordRepeat":"{password}"}}"#),
         format!(r#"{{"username":"{email}","email":"{email}","password":"{password}","confirmPassword":"{password}"}}"#),
         format!(r#"{{"email":"{email}","password":"{password}","password_confirmation":"{password}"}}"#),

