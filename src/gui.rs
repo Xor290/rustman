@@ -1255,275 +1255,275 @@ impl RustmanApp {
 
         // ── Left panel: toolbar + list ────────────────────────────────────
         egui::SidePanel::left("crawler_list_panel")
-            .resizable(true)
-            .default_width(420.0)
-            .min_width(220.0)
-            .show(ctx, |ui| {
-                // Toolbar
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("URL:").color(Color32::DARK_GRAY).size(12.0));
-                    ui.add(
-                        TextEdit::singleline(&mut self.crawler_url)
-                            .hint_text("https://example.com/")
-                            .desired_width(f32::INFINITY)
-                            .font(egui::TextStyle::Monospace),
-                    );
-                });
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Depth:").color(Color32::DARK_GRAY).size(12.0));
-                    ui.add(
-                        egui::DragValue::new(&mut self.crawler_max_depth)
-                            .range(1..=10).speed(1.0),
-                    );
+                .resizable(true)
+                .default_width(420.0)
+                .min_width(220.0)
+                .show(ctx, |ui| {
+                    // Toolbar
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("URL:").color(Color32::DARK_GRAY).size(12.0));
+                        ui.add(
+                            TextEdit::singleline(&mut self.crawler_url)
+                                .hint_text("https://example.com/")
+                                .desired_width(f32::INFINITY)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                    });
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Depth:").color(Color32::DARK_GRAY).size(12.0));
+                        ui.add(
+                            egui::DragValue::new(&mut self.crawler_max_depth)
+                                .range(1..=10).speed(1.0),
+                        );
 
-                    ui.add_space(8.0);
+                        ui.add_space(8.0);
 
-                    if self.crawler_running {
-                        let stop_btn = egui::Button::new(
-                            RichText::new("  ■  Stop  ").size(12.0).color(Color32::WHITE),
-                        ).fill(Color32::from_rgb(180, 50, 50));
-                        if ui.add(stop_btn).clicked() {
-                            if let Some(flag) = &self.crawler_stop {
-                                flag.store(true, Ordering::Relaxed);
+                        if self.crawler_running {
+                            let stop_btn = egui::Button::new(
+                                RichText::new("  ■  Stop  ").size(12.0).color(Color32::WHITE),
+                            ).fill(Color32::from_rgb(180, 50, 50));
+                            if ui.add(stop_btn).clicked() {
+                                if let Some(flag) = &self.crawler_stop {
+                                    flag.store(true, Ordering::Relaxed);
+                                }
                             }
-                        }
-                    } else {
-                        let start_btn = egui::Button::new(
-                            RichText::new("  ▶  Start  ").size(12.0).color(Color32::BLACK),
-                        ).fill(Color32::from_rgb(60, 180, 80));
-                        if ui.add(start_btn).clicked() && !self.crawler_url.trim().is_empty() {
-                            self.crawler_entries.clear();
-                            self.crawler_entry_index.clear();
-                            self.crawler_selected = None;
-                            self.crawler_session_cookie.clear();
-                            self.crawler_auth_bearer.clear();
-                            self.crawler_running = true;
-
-                            let stop = Arc::new(AtomicBool::new(false));
-                            self.crawler_stop = Some(stop.clone());
-
-                            let (tx, rx) = std::sync::mpsc::sync_channel(512);
-                            self.crawler_rx = Some(rx);
-
-                            let url   = self.crawler_url.trim().to_string();
-                            let depth = self.crawler_max_depth;
-                            let config = crate::crawler::CrawlerConfig {
-                                auth: if !self.crawler_auth_user.is_empty() {
-                                    Some(crate::crawler::CrawlerAuth {
-                                        username: self.crawler_auth_user.clone(),
-                                        password: self.crawler_auth_pass.clone(),
-                                        username_field: self.crawler_auth_user_field.clone(),
-                                        password_field: self.crawler_auth_pass_field.clone(),
-                                    })
-                                } else {
-                                    None
-                                },
-                            };
-                            self.rt.spawn(async move {
-                                crate::crawler::run(url, depth, stop, tx, config).await;
-                            });
-                        }
-
-                        if !self.crawler_entries.is_empty() {
-                            ui.add_space(4.0);
-                            if ui.button(RichText::new("Clear").color(Color32::from_rgb(150, 150, 150))).clicked() {
+                        } else {
+                            let start_btn = egui::Button::new(
+                                RichText::new("  ▶  Start  ").size(12.0).color(Color32::BLACK),
+                            ).fill(Color32::from_rgb(60, 180, 80));
+                            if ui.add(start_btn).clicked() && !self.crawler_url.trim().is_empty() {
                                 self.crawler_entries.clear();
                                 self.crawler_entry_index.clear();
                                 self.crawler_selected = None;
                                 self.crawler_session_cookie.clear();
                                 self.crawler_auth_bearer.clear();
-                            }
-                        }
-                    }
-                });
+                                self.crawler_running = true;
 
-                // Stats
-                if !self.crawler_entries.is_empty() {
-                    let total  = self.crawler_entries.len();
-                    let done   = self.crawler_entries.iter().filter(|e| matches!(e.status, EntryStatus::Done(..))).count();
-                    let errors = self.crawler_entries.iter().filter(|e| matches!(e.status, EntryStatus::Failed(_))).count();
-                    let active = total - done - errors;
-                    ui.add_space(2.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(2.0);
-                        ui.colored_label(Color32::from_rgb(80, 200, 100),  format!("✓ {done}"));
-                        ui.add_space(6.0);
-                        ui.colored_label(Color32::from_rgb(220, 70, 70),   format!("✗ {errors}"));
-                        if active > 0 {
-                            ui.add_space(6.0);
-                            ui.colored_label(Color32::from_rgb(255, 160, 60), format!("↻ {active}"));
-                        }
-                    });
-                }
+                                let stop = Arc::new(AtomicBool::new(false));
+                                self.crawler_stop = Some(stop.clone());
 
-                // ── Auth credentials ──────────────────────────────────────
-                ui.horizontal(|ui| {
-                    let auth_lbl = if self.crawler_show_auth { "▼ Auth" } else { "▶ Auth" };
-                    if ui.small_button(auth_lbl).clicked() {
-                        self.crawler_show_auth = !self.crawler_show_auth;
-                    }
-                    let has_session = !self.crawler_session_cookie.is_empty() || !self.crawler_auth_bearer.is_empty();
-                    if has_session {
-                        let label = if !self.crawler_auth_bearer.is_empty() {
-                            "● JWT"
-                        } else {
-                            "● cookie"
-                        };
-                        ui.colored_label(Color32::from_rgb(80, 200, 100), label);
-                    }
-                });
-                if self.crawler_show_auth {
-                    egui::Grid::new("crawler_auth_grid")
-                        .num_columns(2)
-                        .spacing([4.0, 2.0])
-                        .show(ui, |ui| {
-                            ui.label(RichText::new("User:").size(11.0));
-                            ui.add(
-                                TextEdit::singleline(&mut self.crawler_auth_user)
-                                    .desired_width(130.0)
-                                    .hint_text("username / email"),
-                            );
-                            ui.end_row();
-                            ui.label(RichText::new("Pass:").size(11.0));
-                            ui.add(
-                                TextEdit::singleline(&mut self.crawler_auth_pass)
-                                    .password(true)
-                                    .desired_width(130.0),
-                            );
-                            ui.end_row();
-                            ui.label(RichText::new("User field:").size(11.0));
-                            ui.add(
-                                TextEdit::singleline(&mut self.crawler_auth_user_field)
-                                    .hint_text("auto-detect")
-                                    .desired_width(130.0),
-                            );
-                            ui.end_row();
-                            ui.label(RichText::new("Pass field:").size(11.0));
-                            ui.add(
-                                TextEdit::singleline(&mut self.crawler_auth_pass_field)
-                                    .hint_text("auto-detect")
-                                    .desired_width(130.0),
-                            );
-                            ui.end_row();
-                        });
-                    if !self.crawler_auth_bearer.is_empty() {
-                        let preview = if self.crawler_auth_bearer.len() > 48 {
-                            format!("{}…", &self.crawler_auth_bearer[..48])
-                        } else {
-                            self.crawler_auth_bearer.clone()
-                        };
-                        ui.label(
-                            RichText::new(format!("Bearer: {preview}"))
-                                .size(10.0)
-                                .monospace()
-                                .color(Color32::from_rgb(100, 200, 120)),
-                        );
-                    } else if !self.crawler_session_cookie.is_empty() {
-                        let preview = if self.crawler_session_cookie.len() > 50 {
-                            format!("{}…", &self.crawler_session_cookie[..50])
-                        } else {
-                            self.crawler_session_cookie.clone()
-                        };
-                        ui.label(
-                            RichText::new(format!("Cookie: {preview}"))
-                                .size(10.0)
-                                .monospace()
-                                .color(Color32::from_rgb(100, 200, 120)),
-                        );
-                    }
-                }
+                                let (tx, rx) = std::sync::mpsc::sync_channel(512);
+                                self.crawler_rx = Some(rx);
 
-                ui.separator();
-
-                if self.crawler_entries.is_empty() {
-                    ui.add_space(20.0);
-                    ui.centered_and_justified(|ui| {
-                        ui.label(
-                            RichText::new(
-                                "Enter a URL and click Start.\n\nThe crawler follows\ninternal links recursively.",
-                            )
-                            .size(12.0)
-                            .color(Color32::from_rgb(70, 70, 80)),
-                        );
-                    });
-                    return;
-                }
-
-                // Column header
-                ui.horizontal(|ui| {
-                    ui.add_space(8.0);
-                    ui.colored_label(Color32::DARK_GRAY, RichText::new(format!("{:<5}", "CODE")).monospace().size(10.0));
-                    ui.add_space(2.0);
-                    ui.colored_label(Color32::DARK_GRAY, RichText::new("D").monospace().size(10.0));
-                    ui.add_space(6.0);
-                    ui.colored_label(Color32::DARK_GRAY, RichText::new("URL").size(10.0));
-                });
-                ui.add(egui::Separator::default().spacing(2.0));
-
-                // Entries
-                let selected = self.crawler_selected;
-                ScrollArea::vertical()
-                    .id_salt("crawler_list_scroll")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for i in 0..self.crawler_entries.len() {
-                            let entry   = &self.crawler_entries[i];
-                            let is_sel  = selected == Some(i);
-                            let row_h   = 22.0;
-                            let avail_w = ui.available_width();
-                            let (rect, resp) = ui.allocate_exact_size(
-                                Vec2::new(avail_w, row_h),
-                                egui::Sense::click(),
-                            );
-
-                            let bg = if is_sel {
-                                Color32::from_rgb(65, 42, 12)
-                            } else if resp.hovered() {
-                                Color32::from_rgb(34, 37, 52)
-                            } else if i % 2 == 0 {
-                                Color32::from_rgb(21, 21, 25)
-                            } else {
-                                Color32::from_rgb(25, 25, 30)
-                            };
-                            ui.painter().rect_filled(rect, 0.0, bg);
-
-                            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.add_space(8.0);
-                                    let (color, code_str) = entry_color_code(entry);
-                                    ui.colored_label(color, RichText::new(format!("{:<5}", code_str)).monospace().size(11.0));
-                                    ui.add_space(2.0);
-                                    ui.colored_label(
-                                        Color32::from_rgb(100, 100, 120),
-                                        RichText::new(entry.depth.to_string()).monospace().size(11.0),
-                                    );
-                                    ui.add_space(6.0);
-                                    let url_color = match &entry.status {
-                                        EntryStatus::Fetching     => Color32::from_rgb(255, 160, 60),
-                                        EntryStatus::Done(200, _) => Color32::from_rgb(200, 205, 220),
-                                        EntryStatus::Done(..)     => Color32::from_rgb(200, 160, 100),
-                                        EntryStatus::Failed(_)    => Color32::from_rgb(180, 80, 80),
-                                    };
-                                    ui.colored_label(url_color, RichText::new(&entry.url).monospace().size(11.0));
-                                    if let EntryStatus::Done(_, n) = entry.status {
-                                        if n > 0 {
-                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                ui.add_space(8.0);
-                                                ui.colored_label(Color32::from_rgb(80, 140, 80), RichText::new(format!("+{n}")).size(10.0));
-                                            });
-                                        }
-                                    }
+                                let url   = self.crawler_url.trim().to_string();
+                                let depth = self.crawler_max_depth;
+                                let config = crate::crawler::CrawlerConfig {
+                                    auth: if !self.crawler_auth_user.is_empty() {
+                                        Some(crate::crawler::CrawlerAuth {
+                                            username: self.crawler_auth_user.clone(),
+                                            password: self.crawler_auth_pass.clone(),
+                                            username_field: self.crawler_auth_user_field.clone(),
+                                            password_field: self.crawler_auth_pass_field.clone(),
+                                        })
+                                    } else {
+                                        None
+                                    },
+                                };
+                                self.rt.spawn(async move {
+                                    crate::crawler::run(url, depth, stop, tx, config).await;
                                 });
-                            });
+                            }
 
-                            if resp.clicked() {
-                                self.crawler_selected = Some(i);
+                            if !self.crawler_entries.is_empty() {
+                                ui.add_space(4.0);
+                                if ui.button(RichText::new("Clear").color(Color32::from_rgb(150, 150, 150))).clicked() {
+                                    self.crawler_entries.clear();
+                                    self.crawler_entry_index.clear();
+                                    self.crawler_selected = None;
+                                    self.crawler_session_cookie.clear();
+                                    self.crawler_auth_bearer.clear();
+                                }
                             }
                         }
                     });
-            });
+
+                    // Stats
+                    if !self.crawler_entries.is_empty() {
+                        let total  = self.crawler_entries.len();
+                        let done   = self.crawler_entries.iter().filter(|e| matches!(e.status, EntryStatus::Done(..))).count();
+                        let errors = self.crawler_entries.iter().filter(|e| matches!(e.status, EntryStatus::Failed(_))).count();
+                        let active = total - done - errors;
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(2.0);
+                            ui.colored_label(Color32::from_rgb(80, 200, 100),  format!("✓ {done}"));
+                            ui.add_space(6.0);
+                            ui.colored_label(Color32::from_rgb(220, 70, 70),   format!("✗ {errors}"));
+                            if active > 0 {
+                                ui.add_space(6.0);
+                                ui.colored_label(Color32::from_rgb(255, 160, 60), format!("↻ {active}"));
+                            }
+                        });
+                    }
+
+                    // ── Auth credentials ──────────────────────────────────────
+                    ui.horizontal(|ui| {
+                        let auth_lbl = if self.crawler_show_auth { "▼ Auth" } else { "▶ Auth" };
+                        if ui.small_button(auth_lbl).clicked() {
+                            self.crawler_show_auth = !self.crawler_show_auth;
+                        }
+                        let has_session = !self.crawler_session_cookie.is_empty() || !self.crawler_auth_bearer.is_empty();
+                        if has_session {
+                            let label = if !self.crawler_auth_bearer.is_empty() {
+                                "● JWT"
+                            } else {
+                                "● cookie"
+                            };
+                            ui.colored_label(Color32::from_rgb(80, 200, 100), label);
+                        }
+                    });
+                    if self.crawler_show_auth {
+                        egui::Grid::new("crawler_auth_grid")
+                            .num_columns(2)
+                            .spacing([4.0, 2.0])
+                            .show(ui, |ui| {
+                                ui.label(RichText::new("User:").size(11.0));
+                                ui.add(
+                                    TextEdit::singleline(&mut self.crawler_auth_user)
+                                        .desired_width(130.0)
+                                        .hint_text("username / email"),
+                                );
+                                ui.end_row();
+                                ui.label(RichText::new("Pass:").size(11.0));
+                                ui.add(
+                                    TextEdit::singleline(&mut self.crawler_auth_pass)
+                                        .password(true)
+                                        .desired_width(130.0),
+                                );
+                                ui.end_row();
+                                ui.label(RichText::new("User field:").size(11.0));
+                                ui.add(
+                                    TextEdit::singleline(&mut self.crawler_auth_user_field)
+                                        .hint_text("auto-detect")
+                                        .desired_width(130.0),
+                                );
+                                ui.end_row();
+                                ui.label(RichText::new("Pass field:").size(11.0));
+                                ui.add(
+                                    TextEdit::singleline(&mut self.crawler_auth_pass_field)
+                                        .hint_text("auto-detect")
+                                        .desired_width(130.0),
+                                );
+                                ui.end_row();
+                            });
+                        if !self.crawler_auth_bearer.is_empty() {
+                            let preview = if self.crawler_auth_bearer.len() > 48 {
+                                format!("{}…", &self.crawler_auth_bearer[..48])
+                            } else {
+                                self.crawler_auth_bearer.clone()
+                            };
+                            ui.label(
+                                RichText::new(format!("Bearer: {preview}"))
+                                    .size(10.0)
+                                    .monospace()
+                                    .color(Color32::from_rgb(100, 200, 120)),
+                            );
+                        } else if !self.crawler_session_cookie.is_empty() {
+                            let preview = if self.crawler_session_cookie.len() > 50 {
+                                format!("{}…", &self.crawler_session_cookie[..50])
+                            } else {
+                                self.crawler_session_cookie.clone()
+                            };
+                            ui.label(
+                                RichText::new(format!("Cookie: {preview}"))
+                                    .size(10.0)
+                                    .monospace()
+                                    .color(Color32::from_rgb(100, 200, 120)),
+                            );
+                        }
+                    }
+
+                    ui.separator();
+
+                    if self.crawler_entries.is_empty() {
+                        ui.add_space(20.0);
+                        ui.centered_and_justified(|ui| {
+                            ui.label(
+                                RichText::new(
+                                    "Enter a URL and click Start.\n\nThe crawler follows\ninternal links recursively.",
+                                )
+                                .size(12.0)
+                                .color(Color32::from_rgb(70, 70, 80)),
+                            );
+                        });
+                        return;
+                    }
+
+                    // Column header
+                    ui.horizontal(|ui| {
+                        ui.add_space(8.0);
+                        ui.colored_label(Color32::DARK_GRAY, RichText::new(format!("{:<5}", "CODE")).monospace().size(10.0));
+                        ui.add_space(2.0);
+                        ui.colored_label(Color32::DARK_GRAY, RichText::new("D").monospace().size(10.0));
+                        ui.add_space(6.0);
+                        ui.colored_label(Color32::DARK_GRAY, RichText::new("URL").size(10.0));
+                    });
+                    ui.add(egui::Separator::default().spacing(2.0));
+
+                    // Entries
+                    let selected = self.crawler_selected;
+                    ScrollArea::vertical()
+                        .id_salt("crawler_list_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for i in 0..self.crawler_entries.len() {
+                                let entry   = &self.crawler_entries[i];
+                                let is_sel  = selected == Some(i);
+                                let row_h   = 22.0;
+                                let avail_w = ui.available_width();
+                                let (rect, resp) = ui.allocate_exact_size(
+                                    Vec2::new(avail_w, row_h),
+                                    egui::Sense::click(),
+                                );
+
+                                let bg = if is_sel {
+                                    Color32::from_rgb(65, 42, 12)
+                                } else if resp.hovered() {
+                                    Color32::from_rgb(34, 37, 52)
+                                } else if i % 2 == 0 {
+                                    Color32::from_rgb(21, 21, 25)
+                                } else {
+                                    Color32::from_rgb(25, 25, 30)
+                                };
+                                ui.painter().rect_filled(rect, 0.0, bg);
+
+                                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(8.0);
+                                        let (color, code_str) = entry_color_code(entry);
+                                        ui.colored_label(color, RichText::new(format!("{:<5}", code_str)).monospace().size(11.0));
+                                        ui.add_space(2.0);
+                                        ui.colored_label(
+                                            Color32::from_rgb(100, 100, 120),
+                                            RichText::new(entry.depth.to_string()).monospace().size(11.0),
+                                        );
+                                        ui.add_space(6.0);
+                                        let url_color = match &entry.status {
+                                            EntryStatus::Fetching     => Color32::from_rgb(255, 160, 60),
+                                            EntryStatus::Done(200, _) => Color32::from_rgb(200, 205, 220),
+                                            EntryStatus::Done(..)     => Color32::from_rgb(200, 160, 100),
+                                            EntryStatus::Failed(_)    => Color32::from_rgb(180, 80, 80),
+                                        };
+                                        ui.colored_label(url_color, RichText::new(&entry.url).monospace().size(11.0));
+                                        if let EntryStatus::Done(_, n) = entry.status {
+                                            if n > 0 {
+                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                    ui.add_space(8.0);
+                                                    ui.colored_label(Color32::from_rgb(80, 140, 80), RichText::new(format!("+{n}")).size(10.0));
+                                                });
+                                            }
+                                        }
+                                    });
+                                });
+
+                                if resp.clicked() {
+                                    self.crawler_selected = Some(i);
+                                }
+                            }
+                        });
+                });
 
         // ── Central panel: detail ─────────────────────────────────────────
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -1543,34 +1543,48 @@ impl RustmanApp {
                 }
             };
 
-            let entry = &self.crawler_entries[idx];
-            let (color, code_str) = entry_color_code(entry);
+            // On clone tout ce qu'il faut MAINTENANT, tant que `entry` (emprunt
+            // immuable de self.crawler_entries) est encore vivant. Dès que ce
+            // bloc se termine, l'emprunt expire et on peut à nouveau faire
+            // &mut self plus bas (ex: self.exploit_send_analyze(ctx)).
+            let (color, code_str, entry_url, entry_depth, entry_request, entry_response) = {
+                let entry = &self.crawler_entries[idx];
+                let (color, code_str) = entry_color_code(entry);
+                (
+                    color,
+                    code_str,
+                    entry.url.clone(),
+                    entry.depth,
+                    entry.request.clone(),
+                    entry.response.clone(),
+                )
+            };
 
             // Header
             ui.horizontal(|ui| {
                 ui.colored_label(color, RichText::new(&code_str).size(14.0).strong());
                 ui.add_space(8.0);
                 ui.label(
-                    RichText::new(&entry.url)
+                    RichText::new(&entry_url)
                         .size(13.0)
                         .strong()
                         .color(Color32::WHITE),
                 );
                 ui.add_space(8.0);
-                ui.colored_label(Color32::DARK_GRAY, format!("depth {}", entry.depth));
+                ui.colored_label(Color32::DARK_GRAY, format!("depth {}", entry_depth));
 
                 // → Repeater button
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let rep_btn = egui::Button::new(
-                        RichText::new("  → Repeater  ")
+                        RichText::new("  Repeater  ")
                             .size(12.0)
                             .color(Color32::from_rgb(180, 220, 255)),
                     )
                     .fill(Color32::from_rgb(35, 55, 90));
 
                     if ui.add(rep_btn).clicked() {
-                        if let Some(parts) = crate::crawler::parse_url(&entry.url) {
-                            let req_text = String::from_utf8_lossy(&entry.request).into_owned();
+                        if let Some(parts) = crate::crawler::parse_url(&entry_url) {
+                            let req_text = String::from_utf8_lossy(&entry_request).into_owned();
                             let proto = if parts.tls { "HTTPS" } else { "HTTP" };
                             let id = self.rep_next_id;
                             self.rep_next_id += 1;
@@ -1591,9 +1605,21 @@ impl RustmanApp {
                 });
             });
             ui.add(egui::Separator::default().spacing(4.0));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let send_exploit = egui::Button::new(
+                    RichText::new("  Exploit  ")
+                        .size(12.0)
+                        .color(Color32::from_rgb(180, 220, 255)),
+                )
+                .fill(Color32::from_rgb(35, 55, 90));
+                if ui.add(send_exploit).clicked() {
+                    self.exploit_send_analyze(ctx);
+                    self.tab = ActiveTab::Exploit;
+                }
+            });
 
-            let available_h = ui.available_height();
-            let has_resp = !entry.response.is_empty();
+            let available_h = ui.available_height().max(0.0);
+            let has_resp = !entry_response.is_empty();
 
             let (req_h, resp_h) = if has_resp {
                 (available_h * 0.40, available_h * 0.56)
@@ -1601,21 +1627,28 @@ impl RustmanApp {
                 (available_h, 0.0)
             };
 
+            // On clamp toutes les hauteurs dérivées à 0.0 minimum : egui panique
+            // si on lui passe une hauteur négative (ex: premier frame où
+            // available_h est encore très petit, ou panel redimensionné en
+            // dessous de la taille fixe soustraite ici).
+            let req_box_h = (req_h - 16.0).max(0.0);
+            let req_scroll_h = (req_h - 46.0).max(0.0);
+
             // Request
-            let req_text = String::from_utf8_lossy(&entry.request).into_owned();
+            let req_text = String::from_utf8_lossy(&entry_request).into_owned();
             let req_frame = egui::Frame::none()
                 .fill(Color32::from_rgb(20, 22, 28))
                 .rounding(4.0)
                 .inner_margin(egui::Margin::symmetric(8.0, 6.0));
 
             req_frame.show(ui, |ui| {
-                ui.set_min_height(req_h - 16.0);
-                ui.set_max_height(req_h - 16.0);
+                ui.set_min_height(req_box_h);
+                ui.set_max_height(req_box_h);
                 ui.colored_label(Color32::DARK_GRAY, "REQUEST");
                 ui.add_space(4.0);
                 ScrollArea::vertical()
                     .id_salt(format!("crawl_req_{idx}"))
-                    .max_height(req_h - 46.0)
+                    .max_height(req_scroll_h)
                     .show(ui, |ui| {
                         let mut t = req_text;
                         ui.add(
@@ -1632,7 +1665,8 @@ impl RustmanApp {
             // Response
             if has_resp {
                 ui.add_space(4.0);
-                let resp_text = String::from_utf8_lossy(&entry.response).into_owned();
+                let resp_scroll_h = (resp_h - 36.0).max(0.0);
+                let resp_text = String::from_utf8_lossy(&entry_response).into_owned();
                 let resp_frame = egui::Frame::none()
                     .fill(Color32::from_rgb(18, 22, 26))
                     .rounding(4.0)
@@ -1643,7 +1677,7 @@ impl RustmanApp {
                     ui.add_space(4.0);
                     ScrollArea::vertical()
                         .id_salt(format!("crawl_resp_{idx}"))
-                        .max_height(resp_h - 36.0)
+                        .max_height(resp_scroll_h)
                         .show(ui, |ui| {
                             let mut t = resp_text;
                             ui.add(
@@ -1658,9 +1692,7 @@ impl RustmanApp {
                 });
             }
         });
-    }
-
-    // ── Exploit Dev tab ───────────────────────────────────────────────────────
+    } // ── Exploit Dev tab ───────────────────────────────────────────────────────
     fn draw_exploit(&mut self, ctx: &egui::Context) {
         // Left panel: request list
         egui::SidePanel::left("exploit_req_list")

@@ -1,7 +1,6 @@
 use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, DnType,
-    ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
-    PKCS_ECDSA_P256_SHA256,
+    BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
+    KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
@@ -23,19 +22,23 @@ impl Ca {
         std::fs::create_dir_all(&dir).ok();
 
         let cert = load_or_generate(&dir);
-        Self { cert, cache: Mutex::new(HashMap::new()), dir }
+        Self {
+            cert,
+            cache: Mutex::new(HashMap::new()),
+            dir,
+        }
     }
 
-    /// Write the CA cert as PEM to ~/.rustman/ca.crt and return the path.
     pub fn save_pem(&self) -> std::io::Result<PathBuf> {
         let path = self.dir.join("ca.crt");
-        let pem = self.cert.serialize_pem()
+        let pem = self
+            .cert
+            .serialize_pem()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         std::fs::write(&path, pem)?;
         Ok(path)
     }
 
-    /// Return a TLS ServerConfig for `host`, generated and cached on demand.
     pub fn server_config_for(&self, host: &str) -> Arc<ServerConfig> {
         if let Some(c) = self.cache.lock().unwrap().get(host) {
             return c.clone();
@@ -44,14 +47,14 @@ impl Ca {
         let mut p = CertificateParams::new(vec![host.to_string()]);
         p.distinguished_name.push(DnType::CommonName, host);
         p.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-        // Keep short validity — host certs don't need to persist.
         p.not_before = OffsetDateTime::now_utc() - Duration::days(1);
-        p.not_after  = OffsetDateTime::now_utc() + Duration::days(825);
+        p.not_after = OffsetDateTime::now_utc() + Duration::days(825);
 
         let host_cert = Certificate::from_params(p).expect("host cert failed");
-        let signed    = host_cert.serialize_der_with_signer(&self.cert)
+        let signed = host_cert
+            .serialize_der_with_signer(&self.cert)
             .expect("signing failed");
-        let key       = host_cert.serialize_private_key_der();
+        let key = host_cert.serialize_private_key_der();
 
         let cfg = Arc::new(
             ServerConfig::builder()
@@ -63,20 +66,17 @@ impl Ca {
                 .expect("ServerConfig failed"),
         );
 
-        self.cache.lock().unwrap().insert(host.to_string(), cfg.clone());
+        self.cache
+            .lock()
+            .unwrap()
+            .insert(host.to_string(), cfg.clone());
         cfg
     }
 }
 
-// ── Key persistence ───────────────────────────────────────────────────────────
-
-/// Load the CA from ~/.rustman/ca.key if it exists, otherwise generate a new
-/// one and save the key.  Using the same key + fixed dates → same cert DER
-/// every run (ring uses RFC 6979 deterministic ECDSA).
 fn load_or_generate(dir: &Path) -> Certificate {
     let key_path = dir.join("ca.key");
 
-    // Try to load an existing key.
     if let Ok(pem) = std::fs::read_to_string(&key_path) {
         if let Ok(kp) = KeyPair::from_pem(&pem) {
             match Certificate::from_params(ca_params(kp)) {
@@ -89,9 +89,8 @@ fn load_or_generate(dir: &Path) -> Certificate {
         }
     }
 
-    // Generate a fresh key and save it.
     eprintln!("[ca] generating new CA key…");
-    let kp  = KeyPair::generate(&PKCS_ECDSA_P256_SHA256).expect("keygen failed");
+    let kp = KeyPair::generate(&PKCS_ECDSA_P256_SHA256).expect("keygen failed");
     let pem = kp.serialize_pem();
     if let Err(e) = std::fs::write(&key_path, &pem) {
         eprintln!("[ca] warning: could not save key: {e}");
@@ -100,17 +99,16 @@ fn load_or_generate(dir: &Path) -> Certificate {
     Certificate::from_params(ca_params(kp)).expect("CA cert generation failed")
 }
 
-/// Build CertificateParams with a fixed validity window so that the same key
-/// always produces the same TBSCertificate → same signature → same DER.
 fn ca_params(kp: KeyPair) -> CertificateParams {
     let mut p = CertificateParams::new(vec![]);
-    p.is_ca        = IsCa::Ca(BasicConstraints::Unconstrained);
-    p.key_usages   = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    p.distinguished_name.push(DnType::OrganizationName, "rustman");
-    p.distinguished_name.push(DnType::CommonName, "rustman Proxy CA");
-    // Fixed epoch dates → identical TBSCertificate every run.
-    p.not_before   = OffsetDateTime::UNIX_EPOCH;
-    p.not_after    = OffsetDateTime::UNIX_EPOCH + Duration::days(36500); // ~100 years
-    p.key_pair     = Some(kp);
+    p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    p.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    p.distinguished_name
+        .push(DnType::OrganizationName, "rustman");
+    p.distinguished_name
+        .push(DnType::CommonName, "rustman Proxy CA");
+    p.not_before = OffsetDateTime::UNIX_EPOCH;
+    p.not_after = OffsetDateTime::UNIX_EPOCH + Duration::days(36500);
+    p.key_pair = Some(kp);
     p
 }

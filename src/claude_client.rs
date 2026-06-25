@@ -1,3 +1,5 @@
+use rmcp::Json;
+
 use crate::app::Shared;
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -109,7 +111,11 @@ pub async fn chat(
 fn execute_tool(name: &str, input: &serde_json::Value, state: &Shared) -> String {
     match name {
         "list_requests" => {
-            let filter = input["method"].as_str().unwrap_or("").trim().to_ascii_uppercase();
+            let filter = input["method"]
+                .as_str()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_uppercase();
             let s = state.lock().unwrap();
             let items: Vec<serde_json::Value> = s
                 .requests
@@ -126,7 +132,11 @@ fn execute_tool(name: &str, input: &serde_json::Value, state: &Shared) -> String
             serde_json::to_string(&items).unwrap_or_else(|_| "[]".into())
         }
         "get_requests" => {
-            let filter = input["method"].as_str().unwrap_or("").trim().to_ascii_uppercase();
+            let filter = input["method"]
+                .as_str()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_uppercase();
             let s = state.lock().unwrap();
             let items: Vec<serde_json::Value> = s
                 .requests
@@ -150,7 +160,11 @@ fn execute_tool(name: &str, input: &serde_json::Value, state: &Shared) -> String
             let id = input["id"].as_u64().unwrap_or(0) as usize;
             let raw = input["raw"].as_str().unwrap_or("").to_string();
             let mut s = state.lock().unwrap();
-            let bytes = if raw.trim().is_empty() { None } else { Some(raw.into_bytes()) };
+            let bytes = if raw.trim().is_empty() {
+                None
+            } else {
+                Some(raw.into_bytes())
+            };
             match s.requests.iter().position(|r| r.id == id) {
                 Some(idx) => {
                     let bytes = bytes.unwrap_or_else(|| {

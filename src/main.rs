@@ -1,7 +1,7 @@
 mod app;
 mod ca;
-mod cli;
 mod claude_client;
+mod cli;
 mod crawler;
 mod gui;
 mod mcp;
