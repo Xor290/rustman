@@ -1,20 +1,24 @@
 use rmcp::{
-    RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        GetPromptRequestParams, GetPromptResult, ListPromptsResult, PaginatedRequestParams,
-        Prompt, PromptMessage, PromptMessageRole, ServerCapabilities, ServerInfo,
+        GetPromptRequestParams, GetPromptResult, ListPromptsResult, PaginatedRequestParams, Prompt,
+        PromptMessage, PromptMessageRole, ServerCapabilities, ServerInfo,
     },
+    schemars,
     service::RequestContext,
-    schemars, tool, tool_handler, tool_router,
+    tool, tool_handler, tool_router,
     transport::streamable_http_server::{
-        StreamableHttpServerConfig, StreamableHttpService,
-        session::local::LocalSessionManager,
+        session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
     },
+    RoleServer, ServerHandler,
 };
 
-use crate::app::{ChatMessage, Shared};
+use crate::app::Shared;
 
+pub struct ChatMessage {
+    pub from_user: bool,
+    pub text: String,
+}
 // ── HTTP server launcher ──────────────────────────────────────────────────────
 
 pub async fn serve(state: Shared, port: u16) {
@@ -107,11 +111,13 @@ impl RustmanMcp {
             .requests
             .iter()
             .filter(|r| filter.is_empty() || r.method.to_ascii_uppercase() == filter)
-            .map(|r| serde_json::json!({
-                "id": r.id, "method": r.method, "url": r.url,
-                "host": r.host, "port": r.port, "tls": r.tls,
-                "status": format!("{:?}", r.status),
-            }))
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.id, "method": r.method, "url": r.url,
+                    "host": r.host, "port": r.port, "tls": r.tls,
+                    "status": format!("{:?}", r.status),
+                })
+            })
             .collect();
         serde_json::to_string(&items).unwrap_or_else(|_| "[]".into())
     }
@@ -127,15 +133,17 @@ impl RustmanMcp {
             .requests
             .iter()
             .filter(|r| filter.is_empty() || r.method.to_ascii_uppercase() == filter)
-            .map(|r| serde_json::json!({
-                "id": r.id, "method": r.method, "url": r.url,
-                "host": r.host, "port": r.port, "tls": r.tls,
-                "status": format!("{:?}", r.status),
-                "raw": String::from_utf8_lossy(r.edited.as_deref().unwrap_or(&r.raw)),
-                "response": r.response.as_deref()
-                    .map(|b| String::from_utf8_lossy(b).into_owned())
-                    .unwrap_or_default(),
-            }))
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.id, "method": r.method, "url": r.url,
+                    "host": r.host, "port": r.port, "tls": r.tls,
+                    "status": format!("{:?}", r.status),
+                    "raw": String::from_utf8_lossy(r.edited.as_deref().unwrap_or(&r.raw)),
+                    "response": r.response.as_deref()
+                        .map(|b| String::from_utf8_lossy(b).into_owned())
+                        .unwrap_or_default(),
+                })
+            })
             .collect();
         serde_json::to_string(&items).unwrap_or_else(|_| "[]".into())
     }
@@ -149,7 +157,11 @@ ALWAYS show the payload to the user and get confirmation before calling this too
         Parameters(ParamsForwardRequest { id, raw }): Parameters<ParamsForwardRequest>,
     ) -> String {
         let mut state = self.state.lock().unwrap();
-        let bytes = if raw.trim().is_empty() { None } else { Some(raw.into_bytes()) };
+        let bytes = if raw.trim().is_empty() {
+            None
+        } else {
+            Some(raw.into_bytes())
+        };
         let Some(idx) = state.requests.iter().position(|r| r.id == id) else {
             return format!("error: no request with id {id}");
         };
@@ -180,7 +192,12 @@ Always confirm with the user before calling this.")]
 Poll for a message typed by the user in the rustman Claude tab. \
 Returns the message if pending, empty string if none. Consumed after reading.")]
     fn get_user_prompt(&self) -> String {
-        self.state.lock().unwrap().pending_prompt.take().unwrap_or_default()
+        self.state
+            .lock()
+            .unwrap()
+            .pending_prompt
+            .take()
+            .unwrap_or_default()
     }
 
     #[tool(description = "\
@@ -219,7 +236,7 @@ impl ServerHandler for RustmanMcp {
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ListPromptsResult, rmcp::Error> {
+    ) -> Result<ListPromptsResult, rmcp::ErrorData> {
         Ok(ListPromptsResult {
             prompts: vec![
                 Prompt::new(
@@ -242,12 +259,12 @@ impl ServerHandler for RustmanMcp {
         &self,
         request: GetPromptRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<GetPromptResult, rmcp::Error> {
+    ) -> Result<GetPromptResult, rmcp::ErrorData> {
         let text = match request.name.as_str() {
             "pentest-analyst" => PENTEST_PROMPT,
             "general-assistant" => GENERAL_PROMPT,
             other => {
-                return Err(rmcp::Error::invalid_params(
+                return Err(rmcp::ErrorData::invalid_params(
                     format!("unknown prompt: {other}"),
                     None,
                 ))

@@ -44,14 +44,11 @@ pub enum CrawlMsg {
     /// bytes so the GUI can queue them for body-parameter attack generation.
     FormSubmit {
         action_url: String,
-        request:    Vec<u8>,
-        status:     u16,
-        response:   Vec<u8>,
+        request: Vec<u8>,
+        status: u16,
+        response: Vec<u8>,
     },
     Finished,
-    Attack {
-        variant: Vec<AttackVariant>,
-    },
 }
 
 #[derive(Debug, Clone)]
@@ -109,8 +106,8 @@ pub async fn run(
     };
 
     let (base_host, base_port, base_tls) = (base.0.clone(), base.1, base.2);
-    let mut visited: HashSet<String>         = HashSet::new();
-    let mut visited_js: HashSet<String>      = HashSet::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut visited_js: HashSet<String> = HashSet::new();
     let mut queue: VecDeque<(String, usize)> = VecDeque::new();
     let mut js_queue: VecDeque<(String, usize)> = VecDeque::new();
     let mut session_cookies: Vec<(String, String)> = Vec::new();
@@ -135,8 +132,14 @@ pub async fn run(
         if let Some(ref auth) = config.auth {
             if !auth.username.is_empty() {
                 // Try JSON login with provided credentials against all known login paths.
-                if let Some((cookies, bearer)) =
-                    try_json_login(&base_host, base_port, base_tls, &auth.username, &auth.password).await
+                if let Some((cookies, bearer)) = try_json_login(
+                    &base_host,
+                    base_port,
+                    base_tls,
+                    &auth.username,
+                    &auth.password,
+                )
+                .await
                 {
                     logged_in = true;
                     upsert_cookies(&mut session_cookies, cookies);
@@ -163,7 +166,16 @@ pub async fn run(
             "/api/v1/users",
         ];
         'early_reg: for &rp in EARLY_REG_PATHS {
-            if try_json_register(&base_host, base_port, base_tls, rp, &reg_email, &reg_password).await {
+            if try_json_register(
+                &base_host,
+                base_port,
+                base_tls,
+                rp,
+                &reg_email,
+                &reg_password,
+            )
+            .await
+            {
                 registered = true;
                 if let Some((cookies, bearer)) =
                     try_json_login(&base_host, base_port, base_tls, &reg_email, &reg_password).await
@@ -194,9 +206,12 @@ pub async fn run(
             if parent_depth >= max_depth {
                 continue;
             }
-            let Some((jh, jp, jt, jpath)) = parse_url_parts(&js_url) else { continue };
+            let Some((jh, jp, jt, jpath)) = parse_url_parts(&js_url) else {
+                continue;
+            };
             let cookie_hdr = make_cookie_header(&session_cookies);
-            let js_req = build_get_request(&jpath, &jh, &cookie_hdr, auth_bearer.as_deref(), "*/*").into_bytes();
+            let js_req = build_get_request(&jpath, &jh, &cookie_hdr, auth_bearer.as_deref(), "*/*")
+                .into_bytes();
             let js_resp = crate::proxy::repeater_send(&jh, jp, jt, js_req).await;
             let (js_st, js_body) = split_response(&js_resp);
             if js_st == 200 {
@@ -213,7 +228,9 @@ pub async fn run(
             }
         }
 
-        let Some((url, depth)) = queue.pop_front() else { break };
+        let Some((url, depth)) = queue.pop_front() else {
+            break;
+        };
 
         let (host, port, tls, path) = match parse_url_parts(&url) {
             Some(p) => p,
@@ -228,7 +245,13 @@ pub async fn run(
 
         let cookie_hdr = make_cookie_header(&session_cookies);
         let has_auth = !session_cookies.is_empty() || auth_bearer.is_some();
-        let request_str = build_get_request(&path, &host, &cookie_hdr, auth_bearer.as_deref(), "text/html,*/*;q=0.9");
+        let request_str = build_get_request(
+            &path,
+            &host,
+            &cookie_hdr,
+            auth_bearer.as_deref(),
+            "text/html,*/*;q=0.9",
+        );
         let request_bytes = request_str.into_bytes();
 
         let _ = tx.send(CrawlMsg::Visiting {
@@ -256,14 +279,19 @@ pub async fn run(
                             (form.password_field.clone(), auth.password.clone()),
                         ];
                         fields.extend(form.hidden_fields.iter().cloned());
-                        let form_body: String = fields.iter()
+                        let form_body: String = fields
+                            .iter()
                             .map(|(k, v)| format!("{}={}", url_encode_form(k), url_encode_form(v)))
                             .collect::<Vec<_>>()
                             .join("&");
                         let form_body_len = form_body.len();
-                        if let Some((lh, lp, lt, lpath)) =
-                            resolve_form_action(&form.action, &base_host, base_tls, base_port, &path)
-                        {
+                        if let Some((lh, lp, lt, lpath)) = resolve_form_action(
+                            &form.action,
+                            &base_host,
+                            base_tls,
+                            base_port,
+                            &path,
+                        ) {
                             let method_uc = form.method.to_uppercase();
                             let cookie_line = if cookie_hdr.is_empty() {
                                 String::new()
@@ -273,12 +301,16 @@ pub async fn run(
                             let login_req = format!(
                                 "{method_uc} {lpath} HTTP/1.1\r\nHost: {lh}\r\nUser-Agent: rustman-crawler/1.0\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {form_body_len}\r\n{cookie_line}Connection: close\r\n\r\n{form_body}"
                             ).into_bytes();
-                            let login_resp = crate::proxy::repeater_send(&lh, lp, lt, login_req).await;
+                            let login_resp =
+                                crate::proxy::repeater_send(&lh, lp, lt, login_req).await;
                             let new_cookies = extract_set_cookies(&login_resp);
                             if !new_cookies.is_empty() {
                                 upsert_cookies(&mut session_cookies, new_cookies);
                                 let cookie_str = make_cookie_header(&session_cookies);
-                                let _ = tx.send(CrawlMsg::LoggedIn { cookie: cookie_str, bearer: None });
+                                let _ = tx.send(CrawlMsg::LoggedIn {
+                                    cookie: cookie_str,
+                                    bearer: None,
+                                });
                                 for item in retry_after_auth.drain(..) {
                                     queue.push_front(item);
                                 }
@@ -295,14 +327,15 @@ pub async fn run(
                 Some(a) if !a.username.is_empty() => (a.username.clone(), a.password.clone()),
                 _ => (reg_email.clone(), reg_password.clone()),
             };
-            if let Some((cookies, bearer)) =
-                try_json_login(&host, port, tls, &email, &pass).await
-            {
+            if let Some((cookies, bearer)) = try_json_login(&host, port, tls, &email, &pass).await {
                 logged_in = true;
                 upsert_cookies(&mut session_cookies, cookies);
                 auth_bearer = bearer.clone();
                 let cookie_str = make_cookie_header(&session_cookies);
-                let _ = tx.send(CrawlMsg::LoggedIn { cookie: cookie_str, bearer });
+                let _ = tx.send(CrawlMsg::LoggedIn {
+                    cookie: cookie_str,
+                    bearer,
+                });
                 for item in retry_after_auth.drain(..) {
                     queue.push_front(item);
                 }
@@ -319,7 +352,10 @@ pub async fn run(
                     upsert_cookies(&mut session_cookies, new_cookies);
                     auth_bearer = bearer.clone();
                     let cookie_str = make_cookie_header(&session_cookies);
-                    let _ = tx.send(CrawlMsg::LoggedIn { cookie: cookie_str, bearer });
+                    let _ = tx.send(CrawlMsg::LoggedIn {
+                        cookie: cookie_str,
+                        bearer,
+                    });
                     for item in retry_after_auth.drain(..) {
                         queue.push_front(item);
                     }
@@ -396,7 +432,9 @@ pub async fn run(
                 visited_forms.insert(form_key);
 
                 // Fill each field with a test value.
-                let filled: Vec<(String, String)> = form.fields.iter()
+                let filled: Vec<(String, String)> = form
+                    .fields
+                    .iter()
                     .map(|(name, itype, val)| {
                         let v = if !val.is_empty() {
                             val.clone()
@@ -428,7 +466,8 @@ pub async fn run(
                 let method_uc = form.method.to_uppercase();
 
                 let (action_url, form_req_bytes) = if method_uc == "GET" {
-                    let qs: String = filled.iter()
+                    let qs: String = filled
+                        .iter()
                         .map(|(k, v)| format!("{}={}", url_encode_form(k), url_encode_form(v)))
                         .collect::<Vec<_>>()
                         .join("&");
@@ -440,7 +479,8 @@ pub async fn run(
                     .into_bytes();
                     (action_url, req)
                 } else {
-                    let form_body: String = filled.iter()
+                    let form_body: String = filled
+                        .iter()
                         .map(|(k, v)| format!("{}={}", url_encode_form(k), url_encode_form(v)))
                         .collect::<Vec<_>>()
                         .join("&");
@@ -453,7 +493,8 @@ pub async fn run(
                     (action_url, req)
                 };
 
-                let form_resp = crate::proxy::repeater_send(&fh, fp, ft, form_req_bytes.clone()).await;
+                let form_resp =
+                    crate::proxy::repeater_send(&fh, fp, ft, form_req_bytes.clone()).await;
                 let (form_status, _) = split_response(&form_resp);
 
                 let _ = tx.send(CrawlMsg::FormSubmit {
@@ -471,7 +512,13 @@ pub async fn run(
 
 // ── Request / session helpers ─────────────────────────────────────────────────
 
-fn build_get_request(path: &str, host: &str, cookie_hdr: &str, bearer: Option<&str>, accept: &str) -> String {
+fn build_get_request(
+    path: &str,
+    host: &str,
+    cookie_hdr: &str,
+    bearer: Option<&str>,
+    accept: &str,
+) -> String {
     let cookie_line = if cookie_hdr.is_empty() {
         String::new()
     } else {
@@ -487,7 +534,8 @@ fn build_get_request(path: &str, host: &str, cookie_hdr: &str, bearer: Option<&s
 }
 
 fn make_cookie_header(cookies: &[(String, String)]) -> String {
-    cookies.iter()
+    cookies
+        .iter()
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join("; ")
@@ -498,8 +546,12 @@ fn extract_set_cookies(resp: &[u8]) -> Vec<(String, String)> {
     let headers = text.split("\r\n\r\n").next().unwrap_or("");
     let mut cookies = Vec::new();
     for line in headers.lines() {
-        if line.len() < 12 { continue; }
-        if !line[..11].eq_ignore_ascii_case("set-cookie:") { continue; }
+        if line.len() < 12 {
+            continue;
+        }
+        if !line[..11].eq_ignore_ascii_case("set-cookie:") {
+            continue;
+        }
         let val = line[11..].trim();
         if let Some(part) = val.split(';').next() {
             if let Some(eq) = part.find('=') {
@@ -519,7 +571,9 @@ fn extract_attr_value(tag: &str, attr: &str) -> Option<String> {
     let search = format!("{attr}=");
     let pos = lc.find(&search)?;
     let after = &tag[pos + search.len()..];
-    if after.is_empty() { return None; }
+    if after.is_empty() {
+        return None;
+    }
     match after.as_bytes()[0] {
         b'"' => {
             let end = after[1..].find('"')?;
@@ -530,7 +584,9 @@ fn extract_attr_value(tag: &str, attr: &str) -> Option<String> {
             Some(after[1..end + 1].to_string())
         }
         _ => {
-            let end = after.find(|c: char| c.is_whitespace() || c == '>').unwrap_or(after.len());
+            let end = after
+                .find(|c: char| c.is_whitespace() || c == '>')
+                .unwrap_or(after.len());
             Some(after[..end].to_string())
         }
     }
@@ -549,13 +605,14 @@ fn detect_login_form(html: &str, current_path: &str, auth: &CrawlerAuth) -> Opti
     if !lc.contains("type=\"password\"") && !lc.contains("type='password'") {
         return None;
     }
-    let pass_pos = lc.find("type=\"password\"").or_else(|| lc.find("type='password'"))?;
+    let pass_pos = lc
+        .find("type=\"password\"")
+        .or_else(|| lc.find("type='password'"))?;
     // Find the nearest <form before the password field
     let form_start = lc[..pass_pos].rfind("<form")?;
     let form_tag_end = form_start + lc[form_start..].find('>')?;
     let form_tag = &html[form_start..form_tag_end + 1];
-    let action = extract_attr_value(form_tag, "action")
-        .unwrap_or_else(|| current_path.to_string());
+    let action = extract_attr_value(form_tag, "action").unwrap_or_else(|| current_path.to_string());
     let method = extract_attr_value(form_tag, "method")
         .unwrap_or_else(|| "post".to_string())
         .to_ascii_lowercase();
@@ -618,21 +675,30 @@ fn detect_login_form(html: &str, current_path: &str, auth: &CrawlerAuth) -> Opti
         }
 
         ipos = tag_end;
-        if ipos == 0 { break; }
+        if ipos == 0 {
+            break;
+        }
     }
 
     if password_field.is_empty() || username_field.is_empty() {
         return None;
     }
-    Some(LoginForm { action, method, username_field, password_field, hidden_fields })
+    Some(LoginForm {
+        action,
+        method,
+        username_field,
+        password_field,
+        hidden_fields,
+    })
 }
 
 fn url_encode_form(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
-            | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             b' ' => out.push('+'),
             _ => out.push_str(&format!("%{b:02X}")),
         }
@@ -659,7 +725,10 @@ fn resolve_form_action(
     } else if action.is_empty() {
         parse_url_parts(&format!("{proto}://{base_host}{port_sfx}{current_path}"))
     } else {
-        let dir = current_path.rfind('/').map(|i| &current_path[..i + 1]).unwrap_or("/");
+        let dir = current_path
+            .rfind('/')
+            .map(|i| &current_path[..i + 1])
+            .unwrap_or("/");
         parse_url_parts(&format!("{proto}://{base_host}{port_sfx}{dir}{action}"))
     }
 }
@@ -812,40 +881,97 @@ fn is_vendor_js(url: &str) -> bool {
     let filename = filename.split('#').next().unwrap_or(filename);
     // Strip .min.js, .bundle.js, etc.
     let stem = filename
-        .strip_suffix(".js").unwrap_or(filename)
-        .strip_suffix(".min").unwrap_or(filename.strip_suffix(".js").unwrap_or(filename))
+        .strip_suffix(".js")
+        .unwrap_or(filename)
+        .strip_suffix(".min")
+        .unwrap_or(filename.strip_suffix(".js").unwrap_or(filename))
         .to_ascii_lowercase();
 
     // Known library / framework names in filename
     const KNOWN_LIBS: &[&str] = &[
-        "jquery", "jquery-ui", "jquery-migrate",
-        "lodash", "underscore", "ramda",
-        "backbone", "ember", "knockout", "prototype", "mootools",
-        "bootstrap", "foundation", "materialize", "bulma",
-        "moment", "dayjs", "date-fns", "luxon",
-        "d3", "chart", "echarts", "highcharts", "apexcharts", "recharts",
-        "leaflet", "mapbox", "openlayers",
-        "three", "babylon", "pixi", "phaser",
-        "gsap", "anime", "tween",
-        "popper", "tippy", "sweetalert", "toastr", "notyf",
-        "alpinejs", "htmx", "stimulus",
-        "swiper", "slick", "glide", "splide",
-        "fontawesome", "feather",
-        "crypto-js", "forge",
-        "socket.io", "sockjs",
-        "pdfmake", "jspdf", "xlsx",
+        "jquery",
+        "jquery-ui",
+        "jquery-migrate",
+        "lodash",
+        "underscore",
+        "ramda",
+        "backbone",
+        "ember",
+        "knockout",
+        "prototype",
+        "mootools",
+        "bootstrap",
+        "foundation",
+        "materialize",
+        "bulma",
+        "moment",
+        "dayjs",
+        "date-fns",
+        "luxon",
+        "d3",
+        "chart",
+        "echarts",
+        "highcharts",
+        "apexcharts",
+        "recharts",
+        "leaflet",
+        "mapbox",
+        "openlayers",
+        "three",
+        "babylon",
+        "pixi",
+        "phaser",
+        "gsap",
+        "anime",
+        "tween",
+        "popper",
+        "tippy",
+        "sweetalert",
+        "toastr",
+        "notyf",
+        "alpinejs",
+        "htmx",
+        "stimulus",
+        "swiper",
+        "slick",
+        "glide",
+        "splide",
+        "fontawesome",
+        "feather",
+        "crypto-js",
+        "forge",
+        "socket.io",
+        "sockjs",
+        "pdfmake",
+        "jspdf",
+        "xlsx",
     ];
-    if KNOWN_LIBS.iter().any(|lib| stem.starts_with(lib) || stem.contains(&format!("-{lib}")) || stem.contains(&format!(".{lib}"))) {
+    if KNOWN_LIBS.iter().any(|lib| {
+        stem.starts_with(lib)
+            || stem.contains(&format!("-{lib}"))
+            || stem.contains(&format!(".{lib}"))
+    }) {
         return true;
     }
 
     // Webpack vendor chunk patterns
     const VENDOR_STEMS: &[&str] = &[
-        "vendor", "vendors", "chunk-vendors", "vendors~",
-        "polyfill", "polyfills", "runtime", "runtime~",
-        "commons", "common~", "framework",
+        "vendor",
+        "vendors",
+        "chunk-vendors",
+        "vendors~",
+        "polyfill",
+        "polyfills",
+        "runtime",
+        "runtime~",
+        "commons",
+        "common~",
+        "framework",
     ];
-    if VENDOR_STEMS.iter().any(|p| stem.starts_with(p) || stem == *p) {
+    if VENDOR_STEMS
+        .iter()
+        .any(|p| stem.starts_with(p) || stem == *p)
+    {
         return true;
     }
 
@@ -865,22 +991,32 @@ fn extract_script_srcs(
     let mut srcs = Vec::new();
 
     loop {
-        let Some(off) = lower[pos..].find("<script") else { break };
+        let Some(off) = lower[pos..].find("<script") else {
+            break;
+        };
         let tag_start = pos + off + 7;
-        let Some(gt_off) = lower[tag_start..].find('>') else { break };
+        let Some(gt_off) = lower[tag_start..].find('>') else {
+            break;
+        };
         let tag_lc = &lower[tag_start..tag_start + gt_off];
         let tag_orig = &html[tag_start..tag_start + gt_off];
         pos = tag_start + gt_off + 1;
 
-        let Some(src_off) = tag_lc.find("src=") else { continue };
+        let Some(src_off) = tag_lc.find("src=") else {
+            continue;
+        };
         let after = src_off + 4;
-        if after >= tag_orig.len() { continue; }
+        if after >= tag_orig.len() {
+            continue;
+        }
         let (q, str_start) = match tag_orig.as_bytes()[after] {
             b'"' => (b'"', after + 1),
             b'\'' => (b'\'', after + 1),
             _ => continue,
         };
-        let Some(str_end) = tag_orig[str_start..].find(q as char) else { continue };
+        let Some(str_end) = tag_orig[str_start..].find(q as char) else {
+            continue;
+        };
         let src = &tag_orig[str_start..str_start + str_end];
 
         // Only JS files, and only the site's own application code
@@ -904,15 +1040,23 @@ fn extract_inline_js(html: &str) -> String {
     let mut out = String::new();
 
     loop {
-        let Some(off) = lower[pos..].find("<script") else { break };
+        let Some(off) = lower[pos..].find("<script") else {
+            break;
+        };
         let tag_start = pos + off + 7;
-        let Some(gt_off) = lower[tag_start..].find('>') else { break };
+        let Some(gt_off) = lower[tag_start..].find('>') else {
+            break;
+        };
         let tag_lc = &lower[tag_start..tag_start + gt_off];
         pos = tag_start + gt_off + 1;
 
-        if tag_lc.contains("src=") { continue; } // external — handled separately
+        if tag_lc.contains("src=") {
+            continue;
+        } // external — handled separately
 
-        let Some(close_off) = lower[pos..].find("</script>") else { break };
+        let Some(close_off) = lower[pos..].find("</script>") else {
+            break;
+        };
         out.push_str(&html[pos..pos + close_off]);
         out.push('\n');
         pos += close_off + 9;
@@ -931,9 +1075,11 @@ fn enqueue_js_routes(
     visited: &mut HashSet<String>,
     queue: &mut VecDeque<(String, usize)>,
 ) {
-    if parent_depth >= max_depth { return; }
+    if parent_depth >= max_depth {
+        return;
+    }
     let routes = extract_api_routes_from_js(js);
-    let proto   = if base_tls { "https" } else { "http" };
+    let proto = if base_tls { "https" } else { "http" };
     let port_sfx = match (base_tls, base_port) {
         (true, 443) | (false, 80) => String::new(),
         _ => format!(":{base_port}"),
@@ -1116,7 +1262,9 @@ fn next_string_literal(s: &str, start: usize) -> Option<(String, usize)> {
     while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r' | b'(' | b'[') {
         i += 1;
     }
-    if i >= bytes.len() { return None; }
+    if i >= bytes.len() {
+        return None;
+    }
     match bytes[i] {
         q @ (b'"' | b'\'' | b'`') => extract_until_closing_quote(s, i + 1, q),
         _ => None,
@@ -1150,8 +1298,13 @@ fn extract_until_closing_quote(s: &str, start: usize, quote: u8) -> Option<(Stri
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8], start: usize) -> Option<usize> {
-    if needle.is_empty() || start + needle.len() > haystack.len() { return None; }
-    haystack[start..].windows(needle.len()).position(|w| w == needle).map(|p| p + start)
+    if needle.is_empty() || start + needle.len() > haystack.len() {
+        return None;
+    }
+    haystack[start..]
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|p| p + start)
 }
 
 /// Returns `true` if `host` (already stripped of port by `parse_url_parts`) is an
@@ -1174,36 +1327,40 @@ fn is_ip_host(host: &str) -> bool {
 }
 
 fn looks_like_api_path(s: &str) -> bool {
-    if s.is_empty() || s.len() > 512 { return false; }
-    // Must start with / or http
+    if s.is_empty() || s.len() > 512 {
+        return false;
+    }
     if !s.starts_with('/') && !s.starts_with("http://") && !s.starts_with("https://") {
         return false;
     }
-    // Reject protocol-relative URLs — handled separately in enqueue_js_routes.
-    if s.starts_with("//") { return false; }
-    // Reject template expressions
-    if s.contains("${") { return false; }
-    // Reject paths whose first segment looks like an external hostname.
-    // E.g. "/api.ipinfodb.com/v3/..." comes from "//api.ipinfodb.com/..." in JS.
+    if s.starts_with("//") {
+        return false;
+    }
+    if s.contains("${") {
+        return false;
+    }
+
     if s.starts_with('/') {
         let first_seg = s[1..].split('/').next().unwrap_or("").to_ascii_lowercase();
-        // A segment like "api.ipinfodb.com" has a dot followed by 2+ alpha chars (TLD).
         if first_seg.len() > 3 && first_seg.contains('.') {
             let after_last_dot = first_seg.rsplit('.').next().unwrap_or("");
-            if after_last_dot.len() >= 2 && after_last_dot.chars().all(|c| c.is_ascii_alphabetic()) {
+            if after_last_dot.len() >= 2 && after_last_dot.chars().all(|c| c.is_ascii_alphabetic())
+            {
                 return false;
             }
         }
     }
-    // Reject static asset extensions
     let lower = s.split('?').next().unwrap_or(s).to_ascii_lowercase();
     const SKIP: &[&str] = &[
-        ".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg",
-        ".ico", ".woff", ".woff2", ".ttf", ".eot", ".map", ".json",
+        ".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2", ".ttf",
+        ".eot", ".map", ".json",
     ];
-    if SKIP.iter().any(|e| lower.ends_with(e)) { return false; }
-    // Must be more than just "/"
-    if s == "/" { return false; }
+    if SKIP.iter().any(|e| lower.ends_with(e)) {
+        return false;
+    }
+    if s == "/" {
+        return false;
+    }
     true
 }
 
@@ -1265,440 +1422,6 @@ fn resolve(
     }
 }
 
-/// Where in the HTTP request the payload was injected.
-#[derive(Debug, Clone, PartialEq)]
-pub enum AttackTarget {
-    UrlParam(String),
-    Header(String),
-    BodyParam(String),
-}
-
-impl std::fmt::Display for AttackTarget {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AttackTarget::UrlParam(p)  => write!(f, "URL ?{p}"),
-            AttackTarget::Header(h)    => write!(f, "Header {h}"),
-            AttackTarget::BodyParam(p) => write!(f, "Body {p}"),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct AttackVariant {
-    pub url:         String,
-    pub raw_request: Vec<u8>,
-    pub target:      AttackTarget,
-    pub category:    String,
-    pub payload:     String,
-}
-
-// ── Payload files embedded at compile time ────────────────────────────────────
-
-static PAYLOADS: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
-
-fn get_payloads() -> &'static Vec<(String, String)> {
-    PAYLOADS.get_or_init(|| {
-        let mut all = Vec::new();
-        macro_rules! load {
-            ($cat:expr, $src:expr) => {
-                match serde_json::from_str::<Vec<String>>($src) {
-                    Ok(list) => {
-                        for p in list {
-                            all.push(($cat.to_string(), p));
-                        }
-                    }
-                    Err(e) => eprintln!("[attack] failed to parse {} payloads: {e}", $cat),
-                }
-            };
-        }
-        load!("SQLi",          include_str!("../payload/sqli.json"));
-        load!("XSS",           include_str!("../payload/xss.json"));
-        load!("CMDi",          include_str!("../payload/cmdi.json"));
-        load!("PathTraversal", include_str!("../payload/path_traversal.json"));
-        load!("SSRF",          include_str!("../payload/ssrf.json"));
-        load!("SSTI",          include_str!("../payload/ssti.json"));
-        load!("OpenRedirect",  include_str!("../payload/open_redirect.json"));
-        load!("RCE",           include_str!("../payload/rce.json"));
-        all
-    })
-}
-
-// ── Attack variant generators ─────────────────────────────────────────────────
-
-/// Generate all attack variants for a fetched request (URL params + headers + body).
-pub fn attack_request(url: &str, raw: &[u8]) -> Vec<AttackVariant> {
-    let mut out = Vec::new();
-    out.extend(attack_url_params(url, raw));
-    out.extend(attack_fuzz_params(url, raw));
-    out.extend(attack_headers(url, raw));
-    out.extend(attack_body_params(url, raw));
-    out.extend(attack_json_body(url, raw));
-    out
-}
-
-/// Backward-compat alias used in the crawler loop (URL params only, no raw needed).
-pub fn attack(link: &str) -> Vec<AttackVariant> {
-    attack_url_params(link, &[])
-}
-
-/// Inject payloads into every URL query parameter.
-/// If the URL has no query string, nothing is tested.
-fn attack_url_params(url: &str, raw: &[u8]) -> Vec<AttackVariant> {
-    let (base, query_opt) = match url.split_once('?') {
-        Some((b, q)) => (b, Some(q)),
-        None         => (url, None),
-    };
-
-    let pairs: Vec<(&str, &str)> = match query_opt {
-        Some(q) => {
-            let p = parse_kv(q);
-            if p.is_empty() { return vec![]; }
-            p
-        }
-        None => return vec![],
-    };
-
-    let payloads = get_payloads();
-    let mut out  = Vec::new();
-
-    for (target_key, _) in &pairs {
-        for (category, payload) in payloads {
-            let new_query: String = pairs
-                .iter()
-                .map(|(k, v)| {
-                    if k == target_key {
-                        format!("{}={}", k, url_encode(payload))
-                    } else {
-                        format!("{}={}", k, v)
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("&");
-
-            let new_url = format!("{}?{}", base, new_query);
-            let new_raw = replace_url_in_request(raw, url, &new_url);
-            out.push(AttackVariant {
-                url:         new_url,
-                raw_request: new_raw,
-                target:      AttackTarget::UrlParam(target_key.to_string()),
-                category:    category.clone(),
-                payload:     payload.clone(),
-            });
-        }
-    }
-    out
-}
-
-/// Inject payloads into injectable request headers.
-fn attack_headers(url: &str, raw: &[u8]) -> Vec<AttackVariant> {
-    const INJECTABLE_HEADERS: &[&str] = &[
-        "User-Agent",
-        "Referer",
-        "X-Forwarded-For",
-        "X-Forwarded-Host",
-        "X-Real-IP",
-        "X-Custom-IP-Authorization",
-        "X-Original-URL",
-        "Accept-Language",
-        "Origin",
-    ];
-
-    let src = match std::str::from_utf8(raw) {
-        Ok(s) => s,
-        Err(_) => return vec![],
-    };
-
-    let payloads = get_payloads();
-    let mut out  = Vec::new();
-
-    for header_name in INJECTABLE_HEADERS {
-        let header_lc = header_name.to_ascii_lowercase();
-        let present = src.lines().any(|l| {
-            l.to_ascii_lowercase().starts_with(&format!("{}:", header_lc))
-        });
-
-        for (category, payload) in payloads {
-            // Replace if present, append before blank line if absent.
-            let new_raw = if present {
-                replace_header_value(src, &header_lc, payload)
-            } else {
-                append_header(src, header_name, payload)
-            };
-            out.push(AttackVariant {
-                url:         url.to_string(),
-                raw_request: new_raw,
-                target:      AttackTarget::Header(header_name.to_string()),
-                category:    category.clone(),
-                payload:     payload.clone(),
-            });
-        }
-    }
-    out
-}
-
-/// Inject payloads into form-urlencoded body parameters.
-fn attack_body_params(url: &str, raw: &[u8]) -> Vec<AttackVariant> {
-    let src = match std::str::from_utf8(raw) {
-        Ok(s) => s,
-        Err(_) => return vec![],
-    };
-
-    // Only process form-encoded bodies.
-    let is_form = src.lines().any(|l| {
-        l.to_ascii_lowercase().starts_with("content-type:")
-            && l.to_ascii_lowercase().contains("application/x-www-form-urlencoded")
-    });
-    if !is_form { return vec![]; }
-
-    // Body is after the blank line.
-    let body = match src.split_once("\r\n\r\n") {
-        Some((_, b)) => b,
-        None => match src.split_once("\n\n") {
-            Some((_, b)) => b,
-            None => return vec![],
-        },
-    };
-
-    let pairs: Vec<(&str, &str)> = parse_kv(body.trim());
-    if pairs.is_empty() { return vec![]; }
-
-    let payloads = get_payloads();
-    let mut out  = Vec::new();
-
-    for (target_key, _) in &pairs {
-        for (category, payload) in payloads {
-            let new_body: String = pairs
-                .iter()
-                .map(|(k, v)| {
-                    if k == target_key {
-                        format!("{}={}", k, url_encode(payload))
-                    } else {
-                        format!("{}={}", k, v)
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("&");
-
-            let new_raw = replace_body(src, &new_body);
-            out.push(AttackVariant {
-                url:         url.to_string(),
-                raw_request: new_raw,
-                target:      AttackTarget::BodyParam(target_key.to_string()),
-                category:    category.clone(),
-                payload:     payload.clone(),
-            });
-        }
-    }
-    out
-}
-
-/// Inject payloads as new query parameters on API-like URLs that have no existing params.
-/// Covers the common case where the crawler finds routes like `/rest/products/search`
-/// without any `?q=…` — Juice Shop's SQLi lives exactly there.
-fn attack_fuzz_params(url: &str, raw: &[u8]) -> Vec<AttackVariant> {
-    // Only fuzz URLs that have no existing query params (attack_url_params handles those).
-    if url.contains('?') {
-        return vec![];
-    }
-
-    let path_lc = url.to_ascii_lowercase();
-    const API_INDICATORS: &[&str] = &[
-        "/api/", "/rest/", "/v1/", "/v2/", "/v3/",
-        "/graphql", "/gql",
-        "/search", "/query", "/filter",
-        "/products", "/product",
-        "/users", "/user",
-        "/account", "/accounts",
-        "/admin", "/dashboard", "/profile",
-        "/login", "/register", "/signup",
-        "/items", "/item", "/orders", "/order",
-        "/reviews", "/review", "/feedback",
-    ];
-    if !API_INDICATORS.iter().any(|p| path_lc.contains(p)) {
-        return vec![];
-    }
-
-    // Common injectable parameter names.
-    const FUZZ_PARAMS: &[&str] = &[
-        "q", "search", "query", "id", "name", "email",
-        "username", "redirect", "url", "next",
-        "file", "path", "category",
-    ];
-
-    let payloads = get_payloads();
-    let mut out = Vec::new();
-
-    for param in FUZZ_PARAMS {
-        for (category, payload) in payloads {
-            let new_url = format!("{}?{}={}", url, param, url_encode(payload));
-            let new_raw = replace_url_in_request(raw, url, &new_url);
-            out.push(AttackVariant {
-                url:         new_url,
-                raw_request: new_raw,
-                target:      AttackTarget::UrlParam(param.to_string()),
-                category:    category.clone(),
-                payload:     payload.clone(),
-            });
-        }
-    }
-    out
-}
-
-/// Inject payloads into JSON POST body fields for REST API endpoints.
-/// Juice Shop (and most modern SPAs) use JSON bodies, not form-urlencoded.
-fn attack_json_body(url: &str, _raw: &[u8]) -> Vec<AttackVariant> {
-    let path_lc = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
-    const API_INDICATORS: &[&str] = &[
-        "/api/", "/rest/", "/v1/", "/v2/",
-        "/login", "/register", "/signup", "/auth",
-        "/users", "/user", "/account",
-        "/search", "/graphql",
-        "/feedback", "/reviews",
-    ];
-    if !API_INDICATORS.iter().any(|p| path_lc.contains(p)) {
-        return vec![];
-    }
-
-    let Some((host, _port, _tls, path)) = parse_url_parts(url) else {
-        return vec![];
-    };
-
-    const JSON_FIELDS: &[&str] = &[
-        "email", "username", "password", "name",
-        "q", "search", "query", "id",
-        "url", "redirect", "path", "file", "comment",
-    ];
-
-    let payloads = get_payloads();
-    let mut out = Vec::new();
-
-    for field in JSON_FIELDS {
-        for (category, payload) in payloads {
-            let json_escaped = payload.replace('\\', "\\\\").replace('"', "\\\"");
-            let body = format!(r#"{{"{field}":"{json_escaped}"}}"#);
-            let body_len = body.len();
-            let raw_req = format!(
-                "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {body_len}\r\nAccept: application/json\r\nConnection: close\r\n\r\n{body}"
-            )
-            .into_bytes();
-            out.push(AttackVariant {
-                url:         url.to_string(),
-                raw_request: raw_req,
-                target:      AttackTarget::BodyParam(format!("json:{field}")),
-                category:    category.clone(),
-                payload:     payload.clone(),
-            });
-        }
-    }
-    out
-}
-
-// ── Request surgery helpers ───────────────────────────────────────────────────
-
-fn parse_kv<'a>(s: &'a str) -> Vec<(&'a str, &'a str)> {
-    s.split('&')
-        .filter_map(|kv| {
-            let mut it = kv.splitn(2, '=');
-            let k = it.next()?;
-            let v = it.next().unwrap_or("");
-            if k.is_empty() { None } else { Some((k, v)) }
-        })
-        .collect()
-}
-
-/// Swap the URL in the request-line (first line) of a raw HTTP request.
-fn replace_url_in_request(raw: &[u8], _old_url: &str, new_url: &str) -> Vec<u8> {
-    // Use parse_url_parts to correctly extract only the path+query component,
-    // avoiding the old splitn(3, '/') bug that included the host in the path.
-    let path = parse_url_parts(new_url)
-        .map(|(_, _, _, p)| p)
-        .unwrap_or_else(|| "/".to_string());
-
-    if raw.is_empty() {
-        return format!("GET {path} HTTP/1.1\r\nConnection: close\r\n\r\n").into_bytes();
-    }
-    let src = String::from_utf8_lossy(raw);
-
-    // Replace only the path portion in the request-line.
-    if let Some(first_end) = src.find("\r\n").or_else(|| src.find('\n')) {
-        let first_line = &src[..first_end];
-        let mut parts = first_line.splitn(3, ' ');
-        let method  = parts.next().unwrap_or("GET");
-        let _old_path = parts.next().unwrap_or("/");
-        let version = parts.next().unwrap_or("HTTP/1.1");
-        let new_first = format!("{method} {path} {version}");
-        let rest = &src[first_end..];
-        return format!("{new_first}{rest}").into_bytes();
-    }
-    raw.to_vec()
-}
-
-/// Append a new header before the blank line that separates headers from body.
-fn append_header(src: &str, header_name: &str, payload: &str) -> Vec<u8> {
-    let sep = if src.contains("\r\n\r\n") { "\r\n\r\n" } else { "\n\n" };
-    match src.split_once(sep) {
-        Some((headers, body)) => {
-            format!("{}\r\n{}: {}{}{}", headers, header_name, payload, sep, body).into_bytes()
-        }
-        None => {
-            format!("{}\r\n{}: {}\r\n\r\n", src, header_name, payload).into_bytes()
-        }
-    }
-}
-
-/// Replace the value of a header in a raw HTTP request string.
-fn replace_header_value(src: &str, header_lc: &str, payload: &str) -> Vec<u8> {
-    let prefix = format!("{}:", header_lc);
-    src.lines()
-        .map(|line| {
-            if line.to_ascii_lowercase().starts_with(&prefix) {
-                let name = &line[..line.find(':').unwrap_or(line.len())];
-                format!("{}: {}", name, payload)
-            } else {
-                line.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\r\n")
-        .into_bytes()
-}
-
-/// Replace the body of a raw HTTP request with `new_body`.
-fn replace_body(src: &str, new_body: &str) -> Vec<u8> {
-    let sep = if src.contains("\r\n\r\n") { "\r\n\r\n" } else { "\n\n" };
-    let headers = src.split_once(sep).map(|(h, _)| h).unwrap_or(src);
-    // Fix Content-Length.
-    let new_len = new_body.len();
-    let headers = headers
-        .lines()
-        .map(|l| {
-            if l.to_ascii_lowercase().starts_with("content-length:") {
-                format!("Content-Length: {new_len}")
-            } else {
-                l.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\r\n");
-    format!("{headers}{sep}{new_body}").into_bytes()
-}
-
-/// Percent-encode characters that would break a query string.
-fn url_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{:02X}", b)),
-        }
-    }
-    out
-}
-
-// ── Auto-registration helpers ─────────────────────────────────────────────────
-
 fn is_registration_url(url: &str) -> bool {
     let path = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
     // Strip trailing slash for matching
@@ -1728,15 +1451,25 @@ fn is_login_url(url: &str) -> bool {
     let path = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
     let path = path.trim_end_matches('/');
     const PATTERNS: &[&str] = &[
-        "/login", "/signin", "/sign-in",
-        "/auth/login", "/auth/signin", "/auth/token",
-        "/api/login", "/api/signin",
-        "/api/auth/login", "/api/auth/token", "/api/auth",
-        "/api/sessions", "/api/token",
+        "/login",
+        "/signin",
+        "/sign-in",
+        "/auth/login",
+        "/auth/signin",
+        "/auth/token",
+        "/api/login",
+        "/api/signin",
+        "/api/auth/login",
+        "/api/auth/token",
+        "/api/auth",
+        "/api/sessions",
+        "/api/token",
         "/rest/user/login",
         "/oauth/token",
-        "/users/login", "/user/login",
-        "/account/login", "/accounts/login",
+        "/users/login",
+        "/user/login",
+        "/account/login",
+        "/accounts/login",
         "/session/new",
     ];
     PATTERNS.iter().any(|p| path.ends_with(p))
@@ -1770,11 +1503,13 @@ fn extract_all_forms(html: &str, current_path: &str) -> Vec<FormDef> {
 
     while let Some(rel) = lc[pos..].find("<form") {
         let form_start = pos + rel;
-        let Some(gt_rel) = lc[form_start..].find('>') else { break };
+        let Some(gt_rel) = lc[form_start..].find('>') else {
+            break;
+        };
         let tag_end = form_start + gt_rel + 1;
         let form_tag = &html[form_start..tag_end];
-        let action = extract_attr_value(form_tag, "action")
-            .unwrap_or_else(|| current_path.to_string());
+        let action =
+            extract_attr_value(form_tag, "action").unwrap_or_else(|| current_path.to_string());
         let method = extract_attr_value(form_tag, "method")
             .unwrap_or_else(|| "post".to_string())
             .to_ascii_lowercase();
@@ -1783,46 +1518,61 @@ fn extract_all_forms(html: &str, current_path: &str) -> Vec<FormDef> {
             .find("</form>")
             .map(|p| tag_end + p)
             .unwrap_or(html.len());
-        let form_body     = &html[tag_end..body_end];
-        let form_body_lc  = form_body.to_ascii_lowercase();
+        let form_body = &html[tag_end..body_end];
+        let form_body_lc = form_body.to_ascii_lowercase();
 
         let mut fields: Vec<(String, String, String)> = Vec::new();
         let mut ipos = 0;
         while let Some(rel) = form_body_lc[ipos..].find("<input") {
-            let abs      = ipos + rel;
-            let end_rel  = form_body_lc[abs..].find('>').unwrap_or(form_body.len() - abs);
-            let tag_abs  = (abs + end_rel + 1).min(form_body.len());
-            let tag      = &form_body[abs..tag_abs];
-            let itype    = extract_attr_value(tag, "type")
+            let abs = ipos + rel;
+            let end_rel = form_body_lc[abs..]
+                .find('>')
+                .unwrap_or(form_body.len() - abs);
+            let tag_abs = (abs + end_rel + 1).min(form_body.len());
+            let tag = &form_body[abs..tag_abs];
+            let itype = extract_attr_value(tag, "type")
                 .unwrap_or_else(|| "text".to_string())
                 .to_ascii_lowercase();
-            let iname  = extract_attr_value(tag, "name").unwrap_or_default();
+            let iname = extract_attr_value(tag, "name").unwrap_or_default();
             let ivalue = extract_attr_value(tag, "value").unwrap_or_default();
             if !iname.is_empty()
-                && !matches!(itype.as_str(), "submit" | "button" | "image" | "reset" | "file")
+                && !matches!(
+                    itype.as_str(),
+                    "submit" | "button" | "image" | "reset" | "file"
+                )
             {
                 fields.push((iname, itype, ivalue));
             }
             ipos = tag_abs;
-            if ipos == 0 { break; }
+            if ipos == 0 {
+                break;
+            }
         }
         // Also collect <textarea> names.
         let mut tpos = 0;
         while let Some(rel) = form_body_lc[tpos..].find("<textarea") {
-            let abs     = tpos + rel;
-            let end_rel = form_body_lc[abs..].find('>').unwrap_or(form_body.len() - abs);
+            let abs = tpos + rel;
+            let end_rel = form_body_lc[abs..]
+                .find('>')
+                .unwrap_or(form_body.len() - abs);
             let tag_abs = (abs + end_rel + 1).min(form_body.len());
-            let tag     = &form_body[abs..tag_abs];
-            let tname   = extract_attr_value(tag, "name").unwrap_or_default();
+            let tag = &form_body[abs..tag_abs];
+            let tname = extract_attr_value(tag, "name").unwrap_or_default();
             if !tname.is_empty() {
                 fields.push((tname, "textarea".to_string(), String::new()));
             }
             tpos = tag_abs;
-            if tpos == 0 { break; }
+            if tpos == 0 {
+                break;
+            }
         }
 
         if !fields.is_empty() {
-            forms.push(FormDef { action, method, fields });
+            forms.push(FormDef {
+                action,
+                method,
+                fields,
+            });
         }
         pos = body_end + 7;
     }
@@ -1833,29 +1583,44 @@ fn extract_all_forms(html: &str, current_path: &str) -> Vec<FormDef> {
 fn default_field_value(name: &str, itype: &str) -> String {
     let name_lc = name.to_ascii_lowercase();
     match itype {
-        "email"         => return "test@test.local".to_string(),
-        "password"      => return "Test123!".to_string(),
-        "number"
-        | "range"       => return "1".to_string(),
-        "tel"           => return "0000000000".to_string(),
-        "url"           => return "http://test.local".to_string(),
-        "date"          => return "2024-01-01".to_string(),
-        "checkbox"
-        | "radio"       => return "1".to_string(),
-        _               => {}
+        "email" => return "test@test.local".to_string(),
+        "password" => return "Test123!".to_string(),
+        "number" | "range" => return "1".to_string(),
+        "tel" => return "0000000000".to_string(),
+        "url" => return "http://test.local".to_string(),
+        "date" => return "2024-01-01".to_string(),
+        "checkbox" | "radio" => return "1".to_string(),
+        _ => {}
     }
-    if name_lc.contains("email")                               { "test@test.local".to_string() }
-    else if name_lc.contains("pass")                           { "Test123!".to_string() }
-    else if name_lc.contains("phone") || name_lc.contains("tel") { "0000000000".to_string() }
-    else if name_lc.contains("url")  || name_lc.contains("link") { "http://test.local".to_string() }
-    else if name_lc.contains("age")  || name_lc.contains("num")
-         || name_lc.contains("qty")  || name_lc.contains("count") { "1".to_string() }
-    else if name_lc.contains("zip")  || name_lc.contains("postal") { "00000".to_string() }
-    else if name_lc.contains("city") || name_lc.contains("country") { "test".to_string() }
-    else if name_lc.contains("name")                           { "Test User".to_string() }
-    else if name_lc.contains("comment") || name_lc.contains("message")
-         || name_lc.contains("body")    || name_lc.contains("text") { "test comment".to_string() }
-    else                                                       { "test".to_string() }
+    if name_lc.contains("email") {
+        "test@test.local".to_string()
+    } else if name_lc.contains("pass") {
+        "Test123!".to_string()
+    } else if name_lc.contains("phone") || name_lc.contains("tel") {
+        "0000000000".to_string()
+    } else if name_lc.contains("url") || name_lc.contains("link") {
+        "http://test.local".to_string()
+    } else if name_lc.contains("age")
+        || name_lc.contains("num")
+        || name_lc.contains("qty")
+        || name_lc.contains("count")
+    {
+        "1".to_string()
+    } else if name_lc.contains("zip") || name_lc.contains("postal") {
+        "00000".to_string()
+    } else if name_lc.contains("city") || name_lc.contains("country") {
+        "test".to_string()
+    } else if name_lc.contains("name") {
+        "Test User".to_string()
+    } else if name_lc.contains("comment")
+        || name_lc.contains("message")
+        || name_lc.contains("body")
+        || name_lc.contains("text")
+    {
+        "test comment".to_string()
+    } else {
+        "test".to_string()
+    }
 }
 
 async fn try_json_register(
@@ -1868,10 +1633,16 @@ async fn try_json_register(
 ) -> bool {
     let bodies = [
         // Juice Shop: requires passwordRepeat + optional security question
-        format!(r#"{{"email":"{email}","password":"{password}","passwordRepeat":"{password}","securityQuestion":{{"id":1,"question":"Your eldest siblings middle name?","createdAt":"2024-01-01T00:00:00.000Z","updatedAt":"2024-01-01T00:00:00.000Z"}},"securityAnswer":"test"}}"#),
+        format!(
+            r#"{{"email":"{email}","password":"{password}","passwordRepeat":"{password}","securityQuestion":{{"id":1,"question":"Your eldest siblings middle name?","createdAt":"2024-01-01T00:00:00.000Z","updatedAt":"2024-01-01T00:00:00.000Z"}},"securityAnswer":"test"}}"#
+        ),
         format!(r#"{{"email":"{email}","password":"{password}","passwordRepeat":"{password}"}}"#),
-        format!(r#"{{"username":"{email}","email":"{email}","password":"{password}","confirmPassword":"{password}"}}"#),
-        format!(r#"{{"email":"{email}","password":"{password}","password_confirmation":"{password}"}}"#),
+        format!(
+            r#"{{"username":"{email}","email":"{email}","password":"{password}","confirmPassword":"{password}"}}"#
+        ),
+        format!(
+            r#"{{"email":"{email}","password":"{password}","password_confirmation":"{password}"}}"#
+        ),
         format!(r#"{{"email":"{email}","password":"{password}"}}"#),
     ];
     for body in &bodies {
@@ -1959,7 +1730,10 @@ fn extract_bearer_from_json(body: &str) -> Option<String> {
         for &key in *path {
             match cur.get(key) {
                 Some(next) => cur = next,
-                None => { ok = false; break; }
+                None => {
+                    ok = false;
+                    break;
+                }
             }
         }
         if ok {

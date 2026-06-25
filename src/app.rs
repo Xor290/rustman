@@ -1,3 +1,4 @@
+use crate::mcp::ChatMessage;
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
@@ -33,7 +34,8 @@ impl Request {
         String::from_utf8_lossy(self.edited.as_deref().unwrap_or(&self.raw)).into_owned()
     }
     pub fn response_text(&self) -> String {
-        self.response.as_deref()
+        self.response
+            .as_deref()
             .map(|b| String::from_utf8_lossy(b).into_owned())
             .unwrap_or_default()
     }
@@ -118,9 +120,11 @@ impl AppState {
         // Prune oldest completed request when over the limit
         let max = self.settings.max_requests;
         if self.requests.len() > max {
-            if let Some(i) = self.requests.iter().position(
-                |r| !matches!(r.status, Status::Pending | Status::Forwarding)
-            ) {
+            if let Some(i) = self
+                .requests
+                .iter()
+                .position(|r| !matches!(r.status, Status::Pending | Status::Forwarding))
+            {
                 self.requests.remove(i);
             }
         }
@@ -130,7 +134,9 @@ impl AppState {
     pub fn update_status(&mut self, id: usize, status: Status, response: Option<Vec<u8>>) {
         if let Some(r) = self.requests.iter_mut().find(|r| r.id == id) {
             r.status = status;
-            if response.is_some() { r.response = response; }
+            if response.is_some() {
+                r.response = response;
+            }
             self.version += 1;
         }
     }
@@ -170,7 +176,8 @@ impl AppState {
     }
 
     pub fn clear_done(&mut self) {
-        self.requests.retain(|r| matches!(r.status, Status::Pending | Status::Forwarding));
+        self.requests
+            .retain(|r| matches!(r.status, Status::Pending | Status::Forwarding));
     }
 
     pub fn set_edited(&mut self, id: usize, bytes: Vec<u8>) {
@@ -180,7 +187,10 @@ impl AppState {
     }
 
     pub fn pending_count(&self) -> usize {
-        self.requests.iter().filter(|r| r.status == Status::Pending).count()
+        self.requests
+            .iter()
+            .filter(|r| r.status == Status::Pending)
+            .count()
     }
 
     /// Return true if `host` belongs to the currently focused site.
@@ -195,19 +205,16 @@ impl AppState {
     /// Return true if `host` matches any entry in the ignore list.
     pub fn is_ignored(&self, host: &str) -> bool {
         let low = host.to_ascii_lowercase();
-        self.settings.ignore_hosts.iter().any(|pat| low.contains(pat.as_str()))
+        self.settings
+            .ignore_hosts
+            .iter()
+            .any(|pat| low.contains(pat.as_str()))
     }
 }
 
 pub type Shared = Arc<Mutex<AppState>>;
 
 // ── Chat ──────────────────────────────────────────────────────────────────────
-
-#[derive(Clone)]
-pub struct ChatMessage {
-    pub from_user: bool,
-    pub text: String,
-}
 
 /// Extract the registrable domain (e.g. "api.example.com" → "example.com").
 /// Simple heuristic — good enough for common cases.

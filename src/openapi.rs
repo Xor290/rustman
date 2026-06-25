@@ -16,20 +16,18 @@ pub struct ScanResult {
     pub ep_idx: usize,
     pub param: String,
     pub loc: ParamLoc,
-    pub category: String, // nom rapport : "SQLi", "XSS", etc.
+    pub category: String,
     pub payload: String,
     pub status: u16,
     pub response: Vec<u8>,
-    pub evidence: Option<String>, // Some(_) = vulnérabilité confirmée
-    pub raw_request: Vec<u8>,     // peuplé uniquement si evidence.is_some()
+    pub evidence: Option<String>,
+    pub raw_request: Vec<u8>,
 }
 
 /// Messages envoyés par le background scan task vers le GUI.
 pub enum ScanMsg {
     Result(ScanResult),
-    /// Un triple (endpoint, param, catégorie) est terminé (hit ou payloads épuisés).
     TripleDone,
-    /// N payloads ignorés car l'endpoint a déjà une vulnérabilité confirmée.
     Skipped(usize),
     Finished,
 }
@@ -83,17 +81,11 @@ pub fn load_payloads(dir: &str) -> Vec<(String, Vec<String>)> {
 /// Credentials extraites du champ `x-credentials` du spec OpenAPI.
 #[derive(Debug, Clone, Default)]
 pub struct Credentials {
-    /// Valeur brute du Bearer token (sans le préfixe "Bearer ").
     pub bearer: Option<String>,
-    /// Cookie header complet, ex : "session=abc123; csrf=xyz".
     pub cookie: Option<String>,
-    /// Nom d'utilisateur pour le crawler auth.
     pub username: Option<String>,
-    /// Mot de passe pour le crawler auth.
     pub password: Option<String>,
-    /// Nom du header custom (ex : "X-Admin-Key").
     pub api_key_header: Option<String>,
-    /// Valeur du header custom.
     pub api_key_value: Option<String>,
 }
 
@@ -107,92 +99,6 @@ pub struct ApiEndpoint {
 }
 
 impl ApiEndpoint {
-    /// Construit la requête HTTP brute prête à être envoyée sur le réseau.
-    pub fn build_request(
-        &self,
-        host: &str,
-        port: u16,
-        tls: bool,
-        cookie_hdr: &str,
-        bearer: &str,
-        api_key_header: &str,
-        api_key_value: &str,
-    ) -> Vec<u8> {
-        let method = self.method.to_uppercase();
-
-        // Résolution des paramètres de chemin {id} → "1"
-        let mut clean = self.path.clone();
-        loop {
-            if let (Some(a), Some(b)) = (clean.find('{'), clean.find('}')) {
-                if b > a {
-                    clean = format!("{}1{}", &clean[..a], &clean[b + 1..]);
-                    continue;
-                }
-            }
-            break;
-        }
-
-        let query = if !self.query_params.is_empty() {
-            let qs = self
-                .query_params
-                .iter()
-                .map(|p| format!("{p}=test"))
-                .collect::<Vec<_>>()
-                .join("&");
-            format!("?{qs}")
-        } else {
-            String::new()
-        };
-
-        let full_path = format!("{clean}{query}");
-        let port_sfx = match (tls, port) {
-            (true, 443) | (false, 80) => String::new(),
-            _ => format!(":{port}"),
-        };
-        let host_hdr = format!("{host}{port_sfx}");
-
-        let cookie_line = if cookie_hdr.is_empty() {
-            String::new()
-        } else {
-            format!("Cookie: {cookie_hdr}\r\n")
-        };
-        let auth_line = if bearer.is_empty() {
-            String::new()
-        } else {
-            format!("Authorization: Bearer {bearer}\r\n")
-        };
-        let api_key_line = if !api_key_header.is_empty() && !api_key_value.is_empty() {
-            format!("{api_key_header}: {api_key_value}\r\n")
-        } else {
-            String::new()
-        };
-
-        if matches!(method.as_str(), "GET" | "DELETE" | "HEAD" | "OPTIONS") {
-            format!(
-                "{method} {full_path} HTTP/1.1\r\nHost: {host_hdr}\r\nUser-Agent: rustman-scanner/1.0\r\nAccept: application/json\r\n{cookie_line}{auth_line}{api_key_line}Connection: close\r\n\r\n"
-            )
-            .into_bytes()
-        } else {
-            let body = if !self.body_fields.is_empty() {
-                let fields: Vec<String> = self
-                    .body_fields
-                    .iter()
-                    .map(|f| format!("\"{}\":\"test\"", f))
-                    .collect();
-                format!("{{{}}}", fields.join(","))
-            } else {
-                "{}".to_string()
-            };
-            let body_len = body.len();
-            format!(
-                "{method} {full_path} HTTP/1.1\r\nHost: {host_hdr}\r\nContent-Type: application/json\r\nContent-Length: {body_len}\r\nAccept: application/json\r\n{cookie_line}{auth_line}{api_key_line}Connection: close\r\n\r\n{body}"
-            )
-            .into_bytes()
-        }
-    }
-
-    /// Comme `build_request` mais injecte `payload` dans le paramètre `fuzz_param`
-    /// (body field ou query param). Les autres params restent à "test".
     pub fn build_request_fuzzed(
         &self,
         host: &str,

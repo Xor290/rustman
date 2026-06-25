@@ -90,14 +90,7 @@ struct RustmanApp {
     settings_ignore_input: String,
     settings_proxy_addr: String,
     settings_proxy_port: u16,
-    // Claude floating window
-    claude_window_open: bool,
-    claude_selected_req: Option<usize>,
-    claude_req_picker_open: bool,
-    claude_input: String,
-    claude_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
-    claude_thinking: bool,
-    claude_mode: crate::claude_client::AssistantMode,
+
     // Crawler tab
     crawler_url: String,
     crawler_max_depth: usize,
@@ -129,21 +122,21 @@ struct RustmanApp {
     crawler_auth_bearer: String,
     crawler_show_auth: bool,
     // ── Onglet OpenAPI ────────────────────────────────────────────────────────
-    openapi_file_path:    String,
-    openapi_target_url:   String,
-    openapi_endpoints:    Vec<crate::openapi::ApiEndpoint>,
-    openapi_creds:        crate::openapi::Credentials,
+    openapi_file_path: String,
+    openapi_target_url: String,
+    openapi_endpoints: Vec<crate::openapi::ApiEndpoint>,
+    openapi_creds: crate::openapi::Credentials,
     openapi_parse_status: Option<String>,
-    openapi_selected:     Option<usize>,
+    openapi_selected: Option<usize>,
     openapi_selected_res: Option<usize>,
-    openapi_results:      Vec<crate::openapi::ScanResult>,
-    openapi_rx:           Option<std::sync::mpsc::Receiver<crate::openapi::ScanMsg>>,
-    openapi_stop:         Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    openapi_jobs_total:   usize,  // total (ep, param, cat) triples
-    openapi_jobs_done:    usize,  // triples terminés (via TripleDone)
+    openapi_results: Vec<crate::openapi::ScanResult>,
+    openapi_rx: Option<std::sync::mpsc::Receiver<crate::openapi::ScanMsg>>,
+    openapi_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    openapi_jobs_total: usize, // total (ep, param, cat) triples
+    openapi_jobs_done: usize,  // triples terminés (via TripleDone)
     openapi_jobs_skipped: usize,
-    openapi_scanning:     bool,
-    openapi_md_status:    Option<String>,
+    openapi_scanning: bool,
+    openapi_md_status: Option<String>,
 }
 
 impl RustmanApp {
@@ -162,13 +155,6 @@ impl RustmanApp {
             settings_ignore_input: String::new(),
             settings_proxy_addr: "127.0.0.1".to_string(),
             settings_proxy_port: 8080,
-            claude_window_open: false,
-            claude_selected_req: None,
-            claude_req_picker_open: false,
-            claude_input: String::new(),
-            claude_rx: None,
-            claude_thinking: false,
-            claude_mode: crate::claude_client::AssistantMode::General,
             crawler_url: String::new(),
             crawler_max_depth: 3,
             crawler_entries: Vec::new(),
@@ -193,21 +179,21 @@ impl RustmanApp {
             crawler_session_cookie: String::new(),
             crawler_auth_bearer: String::new(),
             crawler_show_auth: false,
-            openapi_file_path:    String::new(),
-            openapi_target_url:   String::new(),
-            openapi_endpoints:    Vec::new(),
-            openapi_creds:        crate::openapi::Credentials::default(),
+            openapi_file_path: String::new(),
+            openapi_target_url: String::new(),
+            openapi_endpoints: Vec::new(),
+            openapi_creds: crate::openapi::Credentials::default(),
             openapi_parse_status: None,
-            openapi_selected:     None,
+            openapi_selected: None,
             openapi_selected_res: None,
-            openapi_results:      Vec::new(),
-            openapi_rx:           None,
-            openapi_stop:         None,
-            openapi_jobs_total:   0,
-            openapi_jobs_done:    0,
+            openapi_results: Vec::new(),
+            openapi_rx: None,
+            openapi_stop: None,
+            openapi_jobs_total: 0,
+            openapi_jobs_done: 0,
             openapi_jobs_skipped: 0,
-            openapi_scanning:     false,
-            openapi_md_status:    None,
+            openapi_scanning: false,
+            openapi_md_status: None,
         }
     }
 
@@ -338,18 +324,22 @@ impl RustmanApp {
                         self.crawler_auth_bearer = b;
                     }
                 }
-                CrawlMsg::FormSubmit { action_url, request, status, response } => {
+                CrawlMsg::FormSubmit {
+                    action_url,
+                    request,
+                    status,
+                    response,
+                } => {
                     let idx = self.crawler_entries.len();
                     self.crawler_entry_index.insert(action_url.clone(), idx);
                     self.crawler_entries.push(crate::crawler::CrawlerEntry {
-                        url:    action_url,
-                        depth:  0,
+                        url: action_url,
+                        depth: 0,
                         status: crate::crawler::EntryStatus::Done(status, 0),
                         request,
                         response,
                     });
                 }
-                CrawlMsg::Attack { .. } => {}
                 CrawlMsg::Finished => {
                     self.crawler_running = false;
                     self.crawler_rx = None;
@@ -358,29 +348,6 @@ impl RustmanApp {
             }
         }
         changed
-    }
-
-    fn poll_claude(&mut self) -> bool {
-        if let Some(rx) = &self.claude_rx {
-            if let Ok(result) = rx.try_recv() {
-                let text = match result {
-                    Ok(t) => t,
-                    Err(e) => format!("Error: {e}"),
-                };
-                self.state
-                    .lock()
-                    .unwrap()
-                    .chat_messages
-                    .push(crate::app::ChatMessage {
-                        from_user: false,
-                        text,
-                    });
-                self.claude_thinking = false;
-                self.claude_rx = None;
-                return true;
-            }
-        }
-        false
     }
 
     fn poll_exploit(&mut self) -> bool {
@@ -437,10 +404,7 @@ impl RustmanApp {
 impl eframe::App for RustmanApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Adaptive repaint: fast when something is in-flight (spinner), slow when idle.
-        let has_inflight = self.crawler_running
-            || self.claude_thinking
-            || self.exploit_thinking
-            || self.openapi_scanning;
+        let has_inflight = self.crawler_running || self.exploit_thinking || self.openapi_scanning;
         ctx.request_repaint_after(std::time::Duration::from_millis(if has_inflight {
             80
         } else {
@@ -466,7 +430,6 @@ impl eframe::App for RustmanApp {
 
         let repaint = self.poll_repeater()
             | self.poll_crawler(ctx)
-            | self.poll_claude()
             | self.poll_exploit()
             | self.poll_openapi();
         if repaint {
@@ -503,9 +466,6 @@ impl eframe::App for RustmanApp {
                 self.draw_exploit(ctx);
             }
         }
-
-        // Floating Claude window — shown over any tab
-        self.draw_claude_window(ctx);
     }
 }
 
@@ -621,18 +581,6 @@ impl RustmanApp {
                     );
                     if ui.add(settings_btn).clicked() {
                         self.tab = ActiveTab::Settings;
-                    }
-
-                    let has_pending = self.cached_pending_prompt;
-                    let claude_label = if has_pending { "Claude ●" } else { "Claude" };
-                    let claude_btn = egui::SelectableLabel::new(
-                        self.claude_window_open,
-                        RichText::new(claude_label)
-                            .size(13.0)
-                            .color(tab_color(self.claude_window_open || has_pending)),
-                    );
-                    if ui.add(claude_btn).clicked() {
-                        self.claude_window_open = !self.claude_window_open;
                     }
 
                     let exploit_btn = egui::SelectableLabel::new(
@@ -1712,320 +1660,6 @@ impl RustmanApp {
         });
     }
 
-    // ── Claude floating window ────────────────────────────────────────────────
-    fn draw_claude_window(&mut self, ctx: &egui::Context) {
-        if !self.claude_window_open {
-            return;
-        }
-        let mut open = self.claude_window_open;
-        egui::Window::new("Claude")
-            .open(&mut open)
-            .resizable(true)
-            .default_size([520.0, 620.0])
-            .min_size([360.0, 300.0])
-            .title_bar(true)
-            .show(ctx, |ui| {
-            ui.vertical(|ui| {
-                // ── Header ────────────────────────────────────────────────
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(8.0);
-                    ui.label(
-                        RichText::new("Claude")
-                            .size(15.0)
-                            .strong()
-                            .color(Color32::from_rgb(255, 150, 50)),
-                    );
-                    ui.add_space(12.0);
-
-                    let is_general = self.claude_mode == crate::claude_client::AssistantMode::General;
-                    let is_pentest = self.claude_mode == crate::claude_client::AssistantMode::Pentest;
-
-                    if ui.add(egui::SelectableLabel::new(is_general,
-                        RichText::new("General").size(12.0)
-                    )).clicked() {
-                        self.claude_mode = crate::claude_client::AssistantMode::General;
-                    }
-                    if ui.add(egui::SelectableLabel::new(is_pentest,
-                        RichText::new("Pentest").size(12.0)
-                            .color(if is_pentest {
-                                Color32::from_rgb(255, 140, 60)
-                            } else {
-                                Color32::GRAY
-                            })
-                    )).clicked() {
-                        self.claude_mode = crate::claude_client::AssistantMode::Pentest;
-                    }
-
-                    ui.add_space(8.0);
-                    ui.colored_label(Color32::DARK_GRAY, if is_pentest {
-                        "Senior Web Pentester — structured pentest reports"
-                    } else {
-                        "General security assistant"
-                    });
-                });
-                ui.add_space(4.0);
-                ui.add(egui::Separator::default().spacing(2.0));
-
-                // ── Request context picker ────────────────────────────────
-                {
-                    let rows: Vec<(usize, usize, String, String, u16, String)> = {
-                        let s = self.state.lock().unwrap();
-                        s.requests.iter().enumerate().map(|(i, r)| {
-                            (i, r.id, r.method.clone(), r.host.clone(), r.port, r.url.clone())
-                        }).collect()
-                    };
-
-                    let sel_label = self.claude_selected_req.and_then(|idx| {
-                        rows.iter().find(|(i, ..)| *i == idx)
-                            .map(|(_, id, method, host, port, url)| {
-                                format!("#{id} {method} {host}:{port}{}", trunc(url, 28))
-                            })
-                    });
-
-                    ui.horizontal(|ui| {
-                        ui.colored_label(Color32::DARK_GRAY, RichText::new("Context:").size(11.0));
-                        ui.add_space(4.0);
-
-                        let picker_label = sel_label.as_deref()
-                            .unwrap_or("no request attached");
-                        let picker_color = if sel_label.is_some() {
-                            Color32::from_rgb(255, 160, 60)
-                        } else {
-                            Color32::DARK_GRAY
-                        };
-
-                        let btn = egui::Button::new(
-                            RichText::new(picker_label).size(11.0).monospace().color(picker_color)
-                        ).frame(true);
-                        if ui.add(btn).clicked() {
-                            self.claude_req_picker_open = !self.claude_req_picker_open;
-                        }
-
-                        if self.claude_selected_req.is_some() {
-                            if ui.small_button("×").on_hover_text("Detach request").clicked() {
-                                self.claude_selected_req = None;
-                                self.claude_req_picker_open = false;
-                            }
-                        }
-                    });
-
-                    if self.claude_req_picker_open && !rows.is_empty() {
-                        egui::Frame::none()
-                            .fill(Color32::from_rgb(18, 20, 26))
-                            .rounding(4.0)
-                            .inner_margin(egui::Margin::symmetric(4.0, 4.0))
-                            .show(ui, |ui| {
-                                ScrollArea::vertical()
-                                    .id_salt("claude_req_picker_scroll")
-                                    .max_height(130.0)
-                                    .show(ui, |ui| {
-                                        for (idx, id, method, host, port, url) in &rows {
-                                            let is_sel = self.claude_selected_req == Some(*idx);
-                                            let mc = method_color(method);
-                                            let row_h = 20.0;
-                                            let avail_w = ui.available_width();
-                                            let (rect, resp) = ui.allocate_exact_size(
-                                                Vec2::new(avail_w, row_h), egui::Sense::click(),
-                                            );
-                                            let bg = if is_sel {
-                                                Color32::from_rgb(65, 42, 12)
-                                            } else if resp.hovered() {
-                                                Color32::from_rgb(38, 30, 18)
-                                            } else {
-                                                Color32::TRANSPARENT
-                                            };
-                                            ui.painter().rect_filled(rect, 0.0, bg);
-                                            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
-                                                ui.horizontal(|ui| {
-                                                    ui.add_space(4.0);
-                                                    ui.colored_label(Color32::DARK_GRAY,
-                                                        RichText::new(format!("#{id:<4}")).monospace().size(10.0));
-                                                    ui.colored_label(mc,
-                                                        RichText::new(format!("{method:<7}")).monospace().size(10.0));
-                                                    ui.colored_label(Color32::from_rgb(180, 185, 210),
-                                                        RichText::new(format!("{host}:{port}")).size(10.0));
-                                                    ui.add_space(4.0);
-                                                    ui.colored_label(Color32::from_rgb(110, 115, 135),
-                                                        RichText::new(trunc(url, 30)).size(10.0));
-                                                });
-                                            });
-                                            if resp.clicked() {
-                                                self.claude_selected_req = Some(*idx);
-                                                self.claude_req_picker_open = false;
-                                            }
-                                        }
-                                    });
-                            });
-                    }
-                }
-                ui.add(egui::Separator::default().spacing(2.0));
-
-                // ── Message history ───────────────────────────────────────
-                let messages: Vec<crate::app::ChatMessage> = {
-                    self.state.lock().unwrap().chat_messages.clone()
-                };
-                let waiting = self.claude_thinking;
-
-                let history_h = ui.available_height() - 72.0;
-                ScrollArea::vertical()
-                    .id_salt("claude_history")
-                    .max_height(history_h)
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        ui.add_space(4.0);
-                        for msg in &messages {
-                            ui.add_space(6.0);
-                            if msg.from_user {
-                                // User bubble — right aligned
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                                    ui.add_space(8.0);
-                                    egui::Frame::none()
-                                        .fill(Color32::from_rgb(60, 35, 12))
-                                        .rounding(8.0)
-                                        .inner_margin(egui::Margin::symmetric(10.0, 6.0))
-                                        .show(ui, |ui| {
-                                            ui.set_max_width(ui.available_width() * 0.75);
-                                            ui.label(
-                                                RichText::new(&msg.text)
-                                                    .size(13.0)
-                                                    .color(Color32::from_rgb(210, 225, 255)),
-                                            );
-                                        });
-                                });
-                            } else {
-                                // Claude bubble — left aligned
-                                ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
-                                    ui.add_space(8.0);
-                                    egui::Frame::none()
-                                        .fill(Color32::from_rgb(28, 32, 42))
-                                        .rounding(8.0)
-                                        .inner_margin(egui::Margin::symmetric(10.0, 6.0))
-                                        .show(ui, |ui| {
-                                            ui.set_max_width(ui.available_width() * 0.85);
-                                            ui.label(
-                                                RichText::new(&msg.text)
-                                                    .size(13.0)
-                                                    .color(Color32::from_rgb(200, 210, 200)),
-                                            );
-                                        });
-                                });
-                            }
-                        }
-
-                        if waiting {
-                            ui.add_space(6.0);
-                            ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
-                                ui.add_space(8.0);
-                                ui.colored_label(
-                                    Color32::from_rgb(255, 160, 60),
-                                    RichText::new("↻  Waiting for Claude Code…").size(12.0).italics(),
-                                );
-                            });
-                        }
-
-                        if messages.is_empty() && !waiting {
-                            ui.add_space(40.0);
-                            ui.centered_and_justified(|ui| {
-                                ui.label(
-                                    RichText::new(
-                                        "Type a message below.\n\n\
-                                         Claude Code will read it via get_user_prompt()\n\
-                                         and reply here via reply_to_user().",
-                                    )
-                                    .size(13.0)
-                                    .color(Color32::from_rgb(60, 65, 80)),
-                                );
-                            });
-                        }
-                    });
-
-                // ── Input bar ─────────────────────────────────────────────
-                ui.add(egui::Separator::default().spacing(4.0));
-                ui.horizontal(|ui| {
-                    let te = TextEdit::singleline(&mut self.claude_input)
-                        .hint_text("Ask Claude Code… (Enter to send)")
-                        .desired_width(ui.available_width() - 70.0)
-                        .font(egui::TextStyle::Body);
-                    let resp = ui.add(te);
-
-                    let send_label = if self.claude_thinking { "  …  " } else { "  Send  " };
-                    let send = ui.add_enabled(
-                        !self.claude_thinking,
-                        egui::Button::new(RichText::new(send_label).color(Color32::BLACK))
-                            .fill(if self.claude_thinking {
-                                Color32::from_rgb(70, 45, 15)
-                            } else {
-                                Color32::from_rgb(200, 110, 25)
-                            }),
-                    );
-                    let send_clicked = !self.claude_thinking
-                        && (send.clicked()
-                            || (resp.lost_focus()
-                                && ctx.input(|i| i.key_pressed(egui::Key::Enter))));
-
-                    if send_clicked {
-                        let text = self.claude_input.trim().to_string();
-                        if !text.is_empty() {
-                            let api_key = self.state.lock().unwrap().settings.api_key.clone();
-                            if api_key.is_empty() {
-                                self.state.lock().unwrap().chat_messages.push(crate::app::ChatMessage {
-                                    from_user: false,
-                                    text: "No API key set. Add your Anthropic API key in the Settings tab.".into(),
-                                });
-                            } else {
-                                {
-                                    let mut s = self.state.lock().unwrap();
-                                    s.chat_messages.push(crate::app::ChatMessage {
-                                        from_user: true,
-                                        text: text.clone(),
-                                    });
-                                }
-                                // Build conversation history, prepending selected request as context.
-                                let req_context = self.claude_selected_req.and_then(|idx| {
-                                    let s = self.state.lock().unwrap();
-                                    s.requests.get(idx).map(|r| {
-                                        let raw = r.edited.as_deref().unwrap_or(&r.raw);
-                                        format!(
-                                            "Intercepted HTTP request (ID {}):\n\n```\n{}\n```",
-                                            r.id,
-                                            String::from_utf8_lossy(raw)
-                                        )
-                                    })
-                                });
-                                let mut history: Vec<serde_json::Value> = Vec::new();
-                                if let Some(ctx) = req_context {
-                                    history.push(serde_json::json!({ "role": "user", "content": ctx }));
-                                    history.push(serde_json::json!({
-                                        "role": "assistant",
-                                        "content": "I have the intercepted request. How can I help you analyze it?"
-                                    }));
-                                }
-                                let msgs = self.state.lock().unwrap().chat_messages.clone();
-                                history.extend(msgs.iter().map(|m| serde_json::json!({
-                                    "role": if m.from_user { "user" } else { "assistant" },
-                                    "content": m.text,
-                                })));
-
-                                let (tx, rx) = std::sync::mpsc::sync_channel(1);
-                                let state_clone = self.state.clone();
-                                let mode = self.claude_mode;
-                                self.rt.spawn(async move {
-                                    crate::claude_client::chat(api_key, mode, state_clone, history, tx).await;
-                                });
-                                self.claude_rx = Some(rx);
-                                self.claude_thinking = true;
-                            }
-                            self.claude_input.clear();
-                        }
-                        resp.request_focus();
-                    }
-                });
-            });
-        });
-        self.claude_window_open = open;
-    }
-
     // ── Exploit Dev tab ───────────────────────────────────────────────────────
     fn draw_exploit(&mut self, ctx: &egui::Context) {
         // Left panel: request list
@@ -2510,7 +2144,9 @@ impl RustmanApp {
     // ── OpenAPI : background scan task ──────────────────────────────────────
 
     fn poll_openapi(&mut self) -> bool {
-        let Some(rx) = &self.openapi_rx else { return false };
+        let Some(rx) = &self.openapi_rx else {
+            return false;
+        };
         let mut changed = false;
         for _ in 0..128 {
             match rx.try_recv() {
@@ -2529,12 +2165,15 @@ impl RustmanApp {
                 Ok(crate::openapi::ScanMsg::Finished) => {
                     self.openapi_scanning = false;
                     self.openapi_rx = None;
-                    let reqs  = self.openapi_results.len();
-                    let vulns: usize = self.openapi_results.iter()
+                    let reqs = self.openapi_results.len();
+                    let vulns: usize = self
+                        .openapi_results
+                        .iter()
                         .filter(|r| r.evidence.is_some())
                         .count();
                     self.openapi_parse_status = Some(format!(
-                        "✓ Scan terminé — {reqs} requêtes · {vulns} vulnérabilité(s) confirmée(s)"));
+                        "✓ Scan terminé — {reqs} requêtes · {vulns} vulnérabilité(s) confirmée(s)"
+                    ));
                     changed = true;
                     break;
                 }
@@ -3190,42 +2829,52 @@ impl RustmanApp {
     /// Démarre le scan OpenAPI en background (comme le crawler).
     /// `ep_filter` = None → tous les endpoints, Some(i) → seulement l'endpoint i.
     fn start_openapi_scan(&mut self, ep_filter: Option<usize>) {
-        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
         use crate::openapi::{ApiEndpoint, ParamLoc, ScanMsg, ScanResult};
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
 
         // ── Cherche le dossier payload/ (plusieurs emplacements possibles) ──
         let payload_dir: std::path::PathBuf = {
             // 1. Répertoire courant (cargo run depuis la racine du projet)
             let from_cwd = std::env::current_dir().ok().map(|d| d.join("payload"));
             // 2. À côté du binaire (installation)
-            let from_exe = std::env::current_exe().ok()
+            let from_exe = std::env::current_exe()
+                .ok()
                 .and_then(|p| p.parent().map(|d| d.join("payload")));
-            from_cwd.iter().chain(from_exe.iter())
+            from_cwd
+                .iter()
+                .chain(from_exe.iter())
                 .find(|p| p.exists())
                 .cloned()
                 .unwrap_or_else(|| std::path::PathBuf::from("payload"))
         };
 
-        let payloads = crate::openapi::load_payloads(
-            payload_dir.to_str().unwrap_or("payload"));
+        let payloads = crate::openapi::load_payloads(payload_dir.to_str().unwrap_or("payload"));
 
         if payloads.is_empty() {
             self.openapi_parse_status = Some(format!(
                 "✗ Aucun payload JSON trouvé dans {} — lance depuis la racine du projet",
-                payload_dir.display()));
+                payload_dir.display()
+            ));
             return;
         }
 
         // ── Endpoints à scanner ─────────────────────────────────────────────
         let endpoints_to_scan: Vec<(usize, ApiEndpoint)> = match ep_filter {
-            None    => self.openapi_endpoints.iter().cloned().enumerate().collect(),
-            Some(i) => self.openapi_endpoints.get(i)
-                .map(|ep| vec![(i, ep.clone())]).unwrap_or_default(),
+            None => self.openapi_endpoints.iter().cloned().enumerate().collect(),
+            Some(i) => self
+                .openapi_endpoints
+                .get(i)
+                .map(|ep| vec![(i, ep.clone())])
+                .unwrap_or_default(),
         };
 
         // ── Total de jobs ───────────────────────────────────────────────────
         let total_payloads: usize = payloads.iter().map(|(_, p)| p.len()).sum();
-        let total: usize = endpoints_to_scan.iter()
+        let total: usize = endpoints_to_scan
+            .iter()
             .map(|(_, ep)| {
                 let n = ep.body_fields.len() + ep.query_params.len() + ep.path_params.len();
                 // Endpoints sans aucun param détecté reçoivent un param fallback.
@@ -3252,7 +2901,9 @@ impl RustmanApp {
         self.openapi_scanning = true;
         self.openapi_parse_status = Some(format!(
             "↻ Scan en cours — {} catégories · {} requêtes",
-            payloads.len(), total));
+            payloads.len(),
+            total
+        ));
 
         let stop = Arc::new(AtomicBool::new(false));
         self.openapi_stop = Some(stop.clone());
@@ -3260,8 +2911,8 @@ impl RustmanApp {
         let (tx, rx) = std::sync::mpsc::sync_channel::<ScanMsg>(1024);
         self.openapi_rx = Some(rx);
 
-        let creds    = self.openapi_creds.clone();
-        let target   = self.openapi_target_url.trim().to_string();
+        let creds = self.openapi_creds.clone();
+        let target = self.openapi_target_url.trim().to_string();
         // Wrap in Arc so each endpoint task gets a cheap clone.
         let payloads = std::sync::Arc::new(payloads);
 
@@ -3274,7 +2925,7 @@ impl RustmanApp {
             };
             let host = parts.host;
             let port = parts.port;
-            let tls  = parts.tls;
+            let tls = parts.tls;
 
             // One task per endpoint; up to 8 endpoints scan concurrently.
             // Within each endpoint task, payloads run sequentially so early-stop
@@ -3283,30 +2934,39 @@ impl RustmanApp {
             let mut handles = Vec::new();
 
             for (ep_idx, ep) in endpoints_to_scan {
-                if stop.load(Ordering::Relaxed) { break; }
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
 
-                let permit    = sem.clone().acquire_owned().await.unwrap();
-                let tx2       = tx.clone();
-                let ep2       = ep.clone();
-                let creds2    = creds.clone();
-                let host2     = host.clone();
-                let stop2     = stop.clone();
+                let permit = sem.clone().acquire_owned().await.unwrap();
+                let tx2 = tx.clone();
+                let ep2 = ep.clone();
+                let creds2 = creds.clone();
+                let host2 = host.clone();
+                let stop2 = stop.clone();
                 let payloads2 = payloads.clone();
 
                 handles.push(tokio::spawn(async move {
                     let _permit = permit;
 
-                    let mut params: Vec<(String, ParamLoc)> = ep2.body_fields.iter()
+                    let mut params: Vec<(String, ParamLoc)> = ep2
+                        .body_fields
+                        .iter()
                         .map(|f| (f.clone(), ParamLoc::Body))
-                        .chain(ep2.query_params.iter().map(|q| (q.clone(), ParamLoc::Query)))
+                        .chain(
+                            ep2.query_params
+                                .iter()
+                                .map(|q| (q.clone(), ParamLoc::Query)),
+                        )
                         .chain(ep2.path_params.iter().map(|p| (p.clone(), ParamLoc::Path)))
                         .collect();
                     // Endpoint sans aucun paramètre détecté : on injecte via un
                     // query param générique pour ne jamais laisser un endpoint non testé.
                     if params.is_empty() {
-                        let fallback = if matches!(ep2.method.to_uppercase().as_str(),
-                            "POST" | "PUT" | "PATCH")
-                        {
+                        let fallback = if matches!(
+                            ep2.method.to_uppercase().as_str(),
+                            "POST" | "PUT" | "PATCH"
+                        ) {
                             ("data".to_string(), ParamLoc::Body)
                         } else {
                             ("id".to_string(), ParamLoc::Query)
@@ -3315,40 +2975,57 @@ impl RustmanApp {
                     }
 
                     let total_ep_payloads: usize = params.len()
-                        * payloads2.as_ref().iter().map(|(_, p)| p.len()).sum::<usize>();
+                        * payloads2
+                            .as_ref()
+                            .iter()
+                            .map(|(_, p)| p.len())
+                            .sum::<usize>();
                     let mut processed = 0usize;
 
                     'ep_loop: for (param, loc) in &params {
                         for (cat, plist) in payloads2.as_ref() {
-                            if stop2.load(Ordering::Relaxed) { break 'ep_loop; }
+                            if stop2.load(Ordering::Relaxed) {
+                                break 'ep_loop;
+                            }
 
                             let display_cat = crate::openapi::payload_cat_name(cat).to_string();
 
                             for payload in plist {
-                                if stop2.load(Ordering::Relaxed) { break 'ep_loop; }
+                                if stop2.load(Ordering::Relaxed) {
+                                    break 'ep_loop;
+                                }
                                 processed += 1;
 
                                 let raw = ep2.build_request_fuzzed(
-                                    &host2, port, tls,
+                                    &host2,
+                                    port,
+                                    tls,
                                     creds2.cookie.as_deref().unwrap_or(""),
                                     creds2.bearer.as_deref().unwrap_or(""),
                                     creds2.api_key_header.as_deref().unwrap_or(""),
                                     creds2.api_key_value.as_deref().unwrap_or(""),
-                                    param, loc, payload,
+                                    param,
+                                    loc,
+                                    payload,
                                 );
                                 let raw_request = raw.clone();
-                                let resp_bytes = crate::proxy::repeater_send(
-                                    &host2, port, tls, raw).await;
+                                let resp_bytes =
+                                    crate::proxy::repeater_send(&host2, port, tls, raw).await;
                                 let status: u16 = std::str::from_utf8(&resp_bytes)
                                     .unwrap_or("")
-                                    .lines().next()
+                                    .lines()
+                                    .next()
                                     .and_then(|l| l.split_whitespace().nth(1))
                                     .and_then(|s| s.parse().ok())
                                     .unwrap_or(0);
 
                                 let evidence = {
                                     let ev = crate::rapport::check_reflected(
-                                        &display_cat, payload, &resp_bytes, None);
+                                        &display_cat,
+                                        payload,
+                                        &resp_bytes,
+                                        None,
+                                    );
                                     if crate::rapport::is_false_positive(&display_cat, status) {
                                         None
                                     } else {
@@ -3359,12 +3036,12 @@ impl RustmanApp {
                                 let vuln_confirmed = evidence.is_some();
                                 let _ = tx2.send(ScanMsg::Result(ScanResult {
                                     ep_idx,
-                                    param:    param.clone(),
-                                    loc:      loc.clone(),
+                                    param: param.clone(),
+                                    loc: loc.clone(),
                                     category: display_cat.clone(),
-                                    payload:  payload.clone(),
+                                    payload: payload.clone(),
                                     status,
-                                    response:    resp_bytes,
+                                    response: resp_bytes,
                                     evidence,
                                     raw_request,
                                 }));
@@ -3382,11 +3059,12 @@ impl RustmanApp {
                 }));
             }
 
-            for h in handles { let _ = h.await; }
+            for h in handles {
+                let _ = h.await;
+            }
             let _ = tx.send(ScanMsg::Finished);
         });
     }
-
 
     // ── Markdown report generation ────────────────────────────────────────────
     fn build_markdown_report(&self) -> String {
@@ -3400,7 +3078,9 @@ impl RustmanApp {
 
         let target = &self.openapi_target_url;
         let total_reqs = self.openapi_results.len();
-        let vulns: Vec<_> = self.openapi_results.iter()
+        let vulns: Vec<_> = self
+            .openapi_results
+            .iter()
             .filter(|r| r.evidence.is_some())
             .collect();
         let vuln_count = vulns.len();
@@ -3420,9 +3100,15 @@ impl RustmanApp {
         let _ = writeln!(md, "| Champ | Valeur |");
         let _ = writeln!(md, "|---|---|");
         let _ = writeln!(md, "| **Cible** | `{target}` |");
-        let _ = writeln!(md, "| **Date** | {y}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC |");
-        let _ = writeln!(md, "| **Endpoints scannés** | {} |",
-            self.openapi_endpoints.len());
+        let _ = writeln!(
+            md,
+            "| **Date** | {y}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC |"
+        );
+        let _ = writeln!(
+            md,
+            "| **Endpoints scannés** | {} |",
+            self.openapi_endpoints.len()
+        );
         let _ = writeln!(md, "| **Requêtes envoyées** | {total_reqs} |");
         let _ = writeln!(md, "| **Vulnérabilités confirmées** | **{vuln_count}** |");
         let _ = writeln!(md);
@@ -3451,14 +3137,16 @@ impl RustmanApp {
             for (cat, results) in &by_cat {
                 for r in results {
                     // Endpoint path
-                    let ep_path = self.openapi_endpoints.get(r.ep_idx)
+                    let ep_path = self
+                        .openapi_endpoints
+                        .get(r.ep_idx)
                         .map(|ep| format!("{} {}", ep.method, ep.path))
                         .unwrap_or_else(|| "Endpoint inconnu".into());
 
                     let loc_s = match r.loc {
-                        crate::openapi::ParamLoc::Body  => "body",
+                        crate::openapi::ParamLoc::Body => "body",
                         crate::openapi::ParamLoc::Query => "query param",
-                        crate::openapi::ParamLoc::Path  => "path param",
+                        crate::openapi::ParamLoc::Path => "path param",
                     };
                     let sev = category_severity(cat);
                     let ev = r.evidence.as_deref().unwrap_or("—");
@@ -3481,16 +3169,21 @@ impl RustmanApp {
                         String::from_utf8_lossy(&r.raw_request).into_owned()
                     } else {
                         // Rebuild it from endpoint + payload
-                        self.openapi_endpoints.get(r.ep_idx)
+                        self.openapi_endpoints
+                            .get(r.ep_idx)
                             .and_then(|ep| {
                                 crate::crawler::parse_url(target).map(|parts| {
                                     let raw = ep.build_request_fuzzed(
-                                        &parts.host, parts.port, parts.tls,
+                                        &parts.host,
+                                        parts.port,
+                                        parts.tls,
                                         self.openapi_creds.cookie.as_deref().unwrap_or(""),
                                         self.openapi_creds.bearer.as_deref().unwrap_or(""),
                                         self.openapi_creds.api_key_header.as_deref().unwrap_or(""),
                                         self.openapi_creds.api_key_value.as_deref().unwrap_or(""),
-                                        &r.param, &r.loc, &r.payload,
+                                        &r.param,
+                                        &r.loc,
+                                        &r.payload,
                                     );
                                     String::from_utf8_lossy(&raw).into_owned()
                                 })
@@ -3521,7 +3214,9 @@ impl RustmanApp {
         let _ = writeln!(md, "| Méthode | Chemin | Paramètres | Vulnérabilités |");
         let _ = writeln!(md, "|---|---|---|---|");
         for (i, ep) in self.openapi_endpoints.iter().enumerate() {
-            let params: Vec<String> = ep.body_fields.iter()
+            let params: Vec<String> = ep
+                .body_fields
+                .iter()
                 .map(|f| format!("`{f}` (body)"))
                 .chain(ep.query_params.iter().map(|q| format!("`{q}` (query)")))
                 .collect();
@@ -3530,7 +3225,9 @@ impl RustmanApp {
             } else {
                 params.join(", ")
             };
-            let ep_vulns: Vec<String> = self.openapi_results.iter()
+            let ep_vulns: Vec<String> = self
+                .openapi_results
+                .iter()
                 .filter(|r| r.ep_idx == i && r.evidence.is_some())
                 .map(|r| format!("{} ({})", r.category, r.param))
                 .collect();
@@ -3539,13 +3236,19 @@ impl RustmanApp {
             } else {
                 ep_vulns.join(", ")
             };
-            let _ = writeln!(md, "| **{}** | `{}` | {} | {} |",
-                ep.method, ep.path, params_str, vuln_str);
+            let _ = writeln!(
+                md,
+                "| **{}** | `{}` | {} | {} |",
+                ep.method, ep.path, params_str, vuln_str
+            );
         }
         let _ = writeln!(md);
         let _ = writeln!(md, "---");
         let _ = writeln!(md);
-        let _ = writeln!(md, "*Rapport généré par **Rustman** — scanner de sécurité OpenAPI*");
+        let _ = writeln!(
+            md,
+            "*Rapport généré par **Rustman** — scanner de sécurité OpenAPI*"
+        );
 
         md
     }
@@ -3889,22 +3592,24 @@ fn render_message_with_code(ui: &mut egui::Ui, text: &str, msg_idx: usize) {
 // ── Report helpers ────────────────────────────────────────────────────────────
 
 fn unix_to_hms(ts: u64) -> (u64, u64, u64, u64, u64, u64) {
-    let s  = ts % 60;
+    let s = ts % 60;
     let mi = (ts / 60) % 60;
-    let h  = (ts / 3600) % 24;
+    let h = (ts / 3600) % 24;
     let days = ts / 86400;
     // Days since 1970-01-01 → year/month/day
     let (y, rem) = days_since_epoch(days);
     let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
     let month_days: &[u64] = if leap {
-        &[31,29,31,30,31,30,31,31,30,31,30,31]
+        &[31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
     } else {
-        &[31,28,31,30,31,30,31,31,30,31,30,31]
+        &[31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
     };
     let mut d_rem = rem;
     let mut mo = 1u64;
     for &md in month_days {
-        if d_rem < md { break; }
+        if d_rem < md {
+            break;
+        }
         d_rem -= md;
         mo += 1;
     }
@@ -3914,8 +3619,14 @@ fn unix_to_hms(ts: u64) -> (u64, u64, u64, u64, u64, u64) {
 fn days_since_epoch(mut days: u64) -> (u64, u64) {
     let mut y = 1970u64;
     loop {
-        let dy = if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 { 366 } else { 365 };
-        if days < dy { return (y, days); }
+        let dy = if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+            366
+        } else {
+            365
+        };
+        if days < dy {
+            return (y, days);
+        }
         days -= dy;
         y += 1;
     }
@@ -3923,12 +3634,12 @@ fn days_since_epoch(mut days: u64) -> (u64, u64) {
 
 fn category_severity(cat: &str) -> &'static str {
     match cat {
-        "CMDi" | "RCE"          => "🔴 Critique",
+        "CMDi" | "RCE" => "🔴 Critique",
         "SQLi" | "PathTraversal" => "🔴 Élevée",
-        "SSRF" | "SSTI"         => "🟠 Élevée",
-        "XSS"                   => "🟡 Moyenne",
-        "OpenRedirect"          => "🟡 Faible",
-        _                       => "⚪ Inconnue",
+        "SSRF" | "SSTI" => "🟠 Élevée",
+        "XSS" => "🟡 Moyenne",
+        "OpenRedirect" => "🟡 Faible",
+        _ => "⚪ Inconnue",
     }
 }
 
