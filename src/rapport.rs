@@ -21,10 +21,6 @@ fn inside_comment(s: &str, pos: usize) -> bool {
     }
 }
 
-/// `true` if `pos` is inside a `<script>` or `<style>` block.
-/// Content inside those tags is JS/CSS source, not visible HTML text, so
-/// markers like `/bin/bash` or `127.0.0.1` that appear there must not be
-/// treated as evidence of a vulnerability.
 fn inside_script_or_style(s: &str, pos: usize) -> bool {
     let before_lc = s[..pos].to_ascii_lowercase();
     let script_pos = before_lc.rfind("<script");

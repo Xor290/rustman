@@ -1,3 +1,7 @@
+// Hide the console window on Windows when double-clicking the .exe (GUI mode).
+// In CLI mode the process re-attaches to the parent terminal before any output.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod app;
 mod ca;
 mod claude_client;
@@ -12,6 +16,18 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 fn main() {
+    // ── CLI flag detection (before any output) ────────────────────────────────
+    let is_cli = std::env::args().any(|a| {
+        matches!(a.as_str(), "--openapi" | "--scan" | "--help" | "-h")
+    });
+
+    // On Windows, re-attach to the parent console so that stdout/stderr work
+    // when the binary is run from cmd.exe or PowerShell with CLI flags.
+    #[cfg(windows)]
+    if is_cli {
+        windows_attach_console();
+    }
+
     // ── CI/CD headless mode ───────────────────────────────────────────────────
     if std::env::args().any(|a| a == "--help" || a == "-h")
         && !std::env::args().any(|a| a == "--scan" || a == "--openapi")
@@ -245,4 +261,19 @@ fn collect_profiles(dir: &Path, out: &mut Vec<PathBuf>) {
             out.push(p);
         }
     }
+}
+
+// ── Windows console attachment ────────────────────────────────────────────────
+// Called only in CLI mode. With windows_subsystem = "windows", the process
+// starts with no console. AttachConsole(ATTACH_PARENT_PROCESS) reconnects to
+// the terminal that launched us (cmd.exe / PowerShell), making stdout/stderr
+// visible. If there is no parent console (e.g. scheduled task), the call is a
+// no-op and output is silently dropped — which is fine for unattended CI runs.
+#[cfg(windows)]
+fn windows_attach_console() {
+    extern "system" {
+        fn AttachConsole(dwProcessId: u32) -> i32;
+    }
+    const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
+    unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
 }

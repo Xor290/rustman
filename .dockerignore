@@ -1,0 +1,7 @@
+target/
+.git/
+*.md
+report.md
+rustman_report_*.md
+vuln-api/
+.dockerignore

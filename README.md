@@ -267,16 +267,110 @@ cargo run -- --openapi spec.yaml --target http://api \
 | `2` | Usage / configuration error |
 | `3` | Scan error (bad spec, connection refused, …) |
 
+### Docker
+
+```bash
+# Build
+docker build -t rustman-scanner .
+
+# Scan — Markdown report on stdout
+docker run --rm rustman-scanner \
+  --openapi /dev/stdin \
+  --target http://api:8080 < spec.yaml
+
+# Mount spec + write report to host
+docker run --rm \
+  -v $(pwd)/spec.yaml:/app/spec.yaml \
+  -v $(pwd)/reports:/reports \
+  rustman-scanner \
+    --openapi /app/spec.yaml \
+    --target http://api:8080 \
+    --output /reports/report.md \
+    --fail-on-vuln
+```
+
+> The runtime image is based on `debian:bookworm-slim` and contains only glibc + CA certificates (~30 MB total). No X11 or OpenGL packages are required — GUI code is never invoked in CLI mode.
+
+#### Scanning an API running on the host machine
+
+From inside a container, `localhost` refers to the container itself, not the host. Use one of the following approaches:
+
+**Option 1 — `--network host` (Linux only, simplest)**
+
+```bash
+docker run --rm \
+  --network host \
+  -v $(pwd)/vuln-api/openapi.yml:/app/spec.yaml \
+  -v $(pwd)/reports:/reports \
+  rustman-scanner \
+    --openapi /app/spec.yaml \
+    --target http://localhost:8090 \
+    --output /reports/report.md \
+    --fail-on-vuln
+```
+
+The container shares the host network stack directly — `localhost:8090` resolves to your host API.
+
+**Option 2 — `host.docker.internal` (works on all platforms)**
+
+```bash
+docker run --rm \
+  --add-host host.docker.internal:host-gateway \
+  -v $(pwd)/vuln-api/openapi.yml:/app/spec.yaml \
+  -v $(pwd)/reports:/reports \
+  rustman-scanner \
+    --openapi /app/spec.yaml \
+    --target http://host.docker.internal:8090 \
+    --output /reports/report.md \
+    --fail-on-vuln
+```
+
+`--add-host host.docker.internal:host-gateway` is required on Linux (Mac/Windows have it automatically).
+
+**Option 3 — Docker Compose (recommended for CI/CD)**
+
+Put the API and scanner in the same Compose project — they can reach each other by service name:
+
+```yaml
+services:
+  api:
+    build: ./vuln-api
+    ports:
+      - "8090:8090"
+
+  scanner:
+    image: rustman-scanner
+    depends_on:
+      - api
+    volumes:
+      - ./vuln-api/openapi.yml:/app/spec.yaml
+      - ./reports:/reports
+    command: >
+      --openapi /app/spec.yaml
+      --target http://api:8090
+      --output /reports/report.md
+      --fail-on-vuln
+```
+
+```bash
+docker compose up --exit-code-from scanner
+```
+
 ### GitHub Actions example
 
 ```yaml
+- name: Build scanner
+  run: docker build -t rustman-scanner .
+
 - name: Security scan
   run: |
-    cargo run -- \
-      --openapi docs/openapi.yaml \
-      --target ${{ env.STAGING_URL }} \
-      --output security-report.md \
-      --fail-on-vuln
+    docker run --rm \
+      -v ${{ github.workspace }}:/workspace \
+      rustman-scanner \
+        --openapi /workspace/docs/openapi.yaml \
+        --target ${{ env.STAGING_URL }} \
+        --output /workspace/security-report.md \
+        --fail-on-vuln
 
 - name: Upload report
   if: always()
@@ -284,6 +378,28 @@ cargo run -- --openapi spec.yaml --target http://api \
   with:
     name: security-report
     path: security-report.md
+```
+
+### GitLab CI example
+
+```yaml
+security-scan:
+  image: docker:latest
+  services:
+    - docker:dind
+  script:
+    - docker build -t rustman-scanner .
+    - docker run --rm
+        -v $CI_PROJECT_DIR:/workspace
+        rustman-scanner
+          --openapi /workspace/docs/openapi.yaml
+          --target $STAGING_URL
+          --output /workspace/gl-sast-report.md
+          --fail-on-vuln
+  artifacts:
+    when: always
+    paths:
+      - gl-sast-report.md
 ```
 
 ---

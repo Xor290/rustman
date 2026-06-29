@@ -8,9 +8,7 @@ use std::sync::Arc;
 pub struct CrawlerAuth {
     pub username: String,
     pub password: String,
-    /// Name of the username form field. Empty = auto-detect.
     pub username_field: String,
-    /// Name of the password form field. Empty = auto-detect.
     pub password_field: String,
 }
 

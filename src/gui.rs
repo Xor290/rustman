@@ -111,6 +111,7 @@ struct RustmanApp {
     exploit_messages: Vec<ExploitMessage>,
     exploit_input: String,
     exploit_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    exploit_http_rx: Option<std::sync::mpsc::Receiver<(Vec<u8>, Vec<u8>)>>,
     exploit_thinking: bool,
     exploit_code: String,
     // Crawler auth credentials (submitted automatically on login pages).
@@ -170,6 +171,7 @@ impl RustmanApp {
             exploit_messages: Vec::new(),
             exploit_input: String::new(),
             exploit_rx: None,
+            exploit_http_rx: None,
             exploit_thinking: false,
             exploit_code: String::new(),
             crawler_auth_user: String::new(),
@@ -350,6 +352,30 @@ impl RustmanApp {
         changed
     }
 
+    fn poll_exploit_http(&mut self) -> bool {
+        let Some(rx) = &self.exploit_http_rx else { return false; };
+        match rx.try_recv() {
+            Ok((req_bytes, resp_bytes)) => {
+                self.exploit_http_rx = None;
+                let req_str = String::from_utf8_lossy(&req_bytes);
+                let resp_str = String::from_utf8_lossy(&resp_bytes);
+                let msg = format!(
+                    "Analyze this HTTP request and its real server response for vulnerabilities. Provide a working PoC exploit.\n\n## Request\n```http\n{}\n```\n\n## Response\n```http\n{}\n```",
+                    req_str.trim(),
+                    resp_str.trim(),
+                );
+                self.exploit_send_message(msg);
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(_) => {
+                self.exploit_http_rx = None;
+                self.exploit_thinking = false;
+                false
+            }
+        }
+    }
+
     fn poll_exploit(&mut self) -> bool {
         if let Some(rx) = &self.exploit_rx {
             if let Ok(result) = rx.try_recv() {
@@ -430,6 +456,7 @@ impl eframe::App for RustmanApp {
 
         let repaint = self.poll_repeater()
             | self.poll_crawler(ctx)
+            | self.poll_exploit_http()
             | self.poll_exploit()
             | self.poll_openapi();
         if repaint {
@@ -934,13 +961,15 @@ impl RustmanApp {
             }
 
             // ── Request / response vertical split ─────────────────────────
-            let available_h = ui.available_height();
+            let available_h = ui.available_height().max(0.0);
             let has_response = !resp_text.is_empty();
             let req_h = if has_response {
                 available_h * 0.52
             } else {
                 available_h
             };
+            let req_inner_h = (req_h - 16.0).max(0.0);
+            let req_scroll_h = (req_h - 48.0).max(0.0);
 
             let req_frame = egui::Frame::none()
                 .fill(Color32::from_rgb(20, 22, 28))
@@ -948,8 +977,8 @@ impl RustmanApp {
                 .inner_margin(egui::Margin::symmetric(8.0, 6.0));
 
             req_frame.show(ui, |ui| {
-                ui.set_min_height(req_h - 16.0);
-                ui.set_max_height(req_h - 16.0);
+                ui.set_min_height(req_inner_h);
+                ui.set_max_height(req_inner_h);
                 ui.horizontal(|ui| {
                     ui.colored_label(Color32::DARK_GRAY, "REQUEST");
                     if is_pending {
@@ -962,7 +991,7 @@ impl RustmanApp {
                 ui.add_space(4.0);
                 ScrollArea::vertical()
                     .id_salt("req_text_scroll")
-                    .max_height(req_h - 48.0)
+                    .max_height(req_scroll_h)
                     .show(ui, |ui| {
                         let te = TextEdit::multiline(&mut self.edit_buf)
                             .font(egui::TextStyle::Monospace)
@@ -1170,7 +1199,7 @@ impl RustmanApp {
             });
             ui.add(egui::Separator::default().spacing(4.0));
 
-            let available_h = ui.available_height();
+            let available_h = ui.available_height().max(0.0);
             let has_response = self.repeater[sel]
                 .response
                 .as_deref()
@@ -1180,6 +1209,8 @@ impl RustmanApp {
             } else {
                 available_h
             };
+            let req_inner_h = (req_h - 16.0).max(0.0);
+            let req_scroll_h = (req_h - 48.0).max(0.0);
 
             // ── Request editor ────────────────────────────────────────────
             let req_frame = egui::Frame::none()
@@ -1188,8 +1219,8 @@ impl RustmanApp {
                 .inner_margin(egui::Margin::symmetric(8.0, 6.0));
 
             req_frame.show(ui, |ui| {
-                ui.set_min_height(req_h - 16.0);
-                ui.set_max_height(req_h - 16.0);
+                ui.set_min_height(req_inner_h);
+                ui.set_max_height(req_inner_h);
                 ui.horizontal(|ui| {
                     ui.colored_label(Color32::DARK_GRAY, "REQUEST");
                     ui.colored_label(Color32::from_rgb(80, 80, 100), "  (edit and Send)");
@@ -1197,7 +1228,7 @@ impl RustmanApp {
                 ui.add_space(4.0);
                 ScrollArea::vertical()
                     .id_salt(format!("rep_req_scroll_{sel}"))
-                    .max_height(req_h - 48.0)
+                    .max_height(req_scroll_h)
                     .show(ui, |ui| {
                         let req_buf = &mut self.repeater[sel].req_buf;
                         let te = TextEdit::multiline(req_buf)
@@ -1605,17 +1636,32 @@ impl RustmanApp {
                 });
             });
             ui.add(egui::Separator::default().spacing(4.0));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let send_exploit = egui::Button::new(
-                    RichText::new("  Exploit  ")
-                        .size(12.0)
-                        .color(Color32::from_rgb(180, 220, 255)),
-                )
-                .fill(Color32::from_rgb(35, 55, 90));
-                if ui.add(send_exploit).clicked() {
-                    self.exploit_send_analyze(ctx);
-                    self.tab = ActiveTab::Exploit;
-                }
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let send_exploit = egui::Button::new(
+                        RichText::new("  Exploit  ")
+                            .size(12.0)
+                            .color(Color32::from_rgb(180, 220, 255)),
+                    )
+                    .fill(Color32::from_rgb(35, 55, 90));
+                    if ui.add(send_exploit).clicked() {
+                        if let Some(parts) = crate::crawler::parse_url(&entry_url) {
+                            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                            self.exploit_http_rx = Some(rx);
+                            self.exploit_thinking = true;
+                            let req = entry_request.clone();
+                            let req2 = req.clone();
+                            let host = parts.host.clone();
+                            let port = parts.port;
+                            let tls = parts.tls;
+                            self.rt.spawn(async move {
+                                let resp = crate::proxy::repeater_send(&host, port, tls, req).await;
+                                let _ = tx.send((req2, resp));
+                            });
+                        }
+                        self.tab = ActiveTab::Exploit;
+                    }
+                });
             });
 
             let available_h = ui.available_height().max(0.0);
@@ -1941,7 +1987,7 @@ impl RustmanApp {
                 }
 
                 // ── Message history ───────────────────────────────────────
-                let history_h = ui.available_height() - 56.0;
+                let history_h = (ui.available_height() - 56.0).max(0.0);
                 ScrollArea::vertical()
                     .id_salt("exploit_history")
                     .max_height(history_h)
@@ -2052,7 +2098,7 @@ impl RustmanApp {
                         .hint_text(
                             "Ask about the request, request a PoC, suggest a payload… (Enter)",
                         )
-                        .desired_width(ui.available_width() - 80.0)
+                        .desired_width((ui.available_width() - 80.0).max(40.0))
                         .font(egui::TextStyle::Body);
                     let resp = ui.add(te);
 
@@ -2548,7 +2594,7 @@ impl RustmanApp {
             });
             ui.add(egui::Separator::default().spacing(4.0));
 
-            let available_h = ui.available_height();
+            let available_h = ui.available_height().max(0.0);
 
             // Résultats de cet endpoint
             let ep_res_indices: Vec<usize> = self.openapi_results
@@ -2606,7 +2652,7 @@ impl RustmanApp {
 
                     ScrollArea::vertical()
                         .id_salt("openapi_res_table")
-                        .max_height(table_h - 32.0)
+                        .max_height((table_h - 32.0).max(0.0))
                         .auto_shrink([false,false])
                         .show(ui, |ui| {
                             for &ri in &ep_res_indices {
@@ -2713,7 +2759,7 @@ impl RustmanApp {
             if let Some(ri) = self.openapi_selected_res {
                 if let Some(r) = self.openapi_results.get(ri).cloned() {
                     ui.add_space(4.0);
-                    let avail = ui.available_height();
+                    let avail = ui.available_height().max(0.0);
 
                     let req_display = if let Some(parts) =
                         crate::crawler::parse_url(self.openapi_target_url.trim())
@@ -2818,7 +2864,7 @@ impl RustmanApp {
                                 }
                                 ScrollArea::vertical()
                                     .id_salt(format!("oa_req_{ri}"))
-                                    .max_height(avail - 30.0)
+                                    .max_height((avail - 30.0).max(0.0))
                                     .show(ui, |ui| {
                                         let mut t = req_display;
                                         ui.add(TextEdit::multiline(&mut t)
@@ -2842,7 +2888,7 @@ impl RustmanApp {
                             .show(&mut cols[1], |ui| {
                                 ScrollArea::vertical()
                                     .id_salt(format!("oa_resp_{ri}"))
-                                    .max_height(avail - 30.0)
+                                    .max_height((avail - 30.0).max(0.0))
                                     .show(ui, |ui| {
                                         let mut t = resp_text;
                                         ui.add(TextEdit::multiline(&mut t)

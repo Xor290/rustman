@@ -98,6 +98,20 @@ pub struct ApiEndpoint {
     pub path_params: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct Remediation {
+    pub vuln_type: String,
+    pub remediation_text: String,
+    pub cvss: u8,
+    pub categorie_owasp: String,
+}
+
+pub struct PayloadCategories {
+    pub sqli: String,
+    pub xxe: String,
+    pub xss: String,
+}
+
 impl ApiEndpoint {
     pub fn build_request_fuzzed(
         &self,
