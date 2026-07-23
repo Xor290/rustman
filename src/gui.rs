@@ -1,7 +1,14 @@
 use crate::app::{Shared, Status};
+use axum::extract::connect_info::Connected;
 use eframe::egui::{self, Color32, RichText, ScrollArea, TextEdit, Vec2};
+use serde::de::Unexpected::Enum;
+use std::sync::mpsc;
 use std::sync::Arc;
-
+use std::thread;
+use tokio::{
+    io::{Stderr, Stdout},
+    process,
+};
 fn load_window_icon() -> std::sync::Arc<egui::IconData> {
     let bytes = include_bytes!("../logo.png");
     let img = image::load_from_memory(bytes)
@@ -70,6 +77,146 @@ struct ExploitMessage {
     text: String,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum ExecLang {
+    Bash,
+    Python,
+    None,
+}
+
+struct ExecOutput {
+    stdout: String,
+    stderr: String,
+    code: Option<i32>,
+    timed_out: bool,
+}
+
+fn detect_exec_lang(code: &str) -> ExecLang {
+    let trimmed = code.trim_start();
+    if let Some(first_line) = trimmed.lines().next() {
+        if first_line.starts_with("#!") {
+            if first_line.contains("python") {
+                return ExecLang::Python;
+            }
+            return ExecLang::Bash;
+        }
+    }
+    ExecLang::None
+}
+
+/// Écrit `code` dans un fichier temporaire et l'exécute via l'interpréteur
+/// correspondant à `lang`. Tourne dans un thread dédié (appelé depuis
+/// `exploit_exec_run`) : bloque ce thread, jamais le thread UI.
+fn run_exec_script(lang: ExecLang, code: &str) -> ExecOutput {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+
+    let (interpreter, ext) = match lang {
+        ExecLang::Bash => ("bash", "sh"),
+        ExecLang::Python => ("python3", "py"),
+        ExecLang::None => {
+            return ExecOutput {
+                stdout: String::new(),
+                stderr: "Langage non pris en compte ou non détecté".into(),
+                code: None,
+                timed_out: false,
+            };
+        }
+    };
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "rustman_exploit_{}_{nanos}.{ext}",
+        std::process::id()
+    ));
+
+    if let Err(e) = std::fs::File::create(&path).and_then(|mut f| f.write_all(code.as_bytes())) {
+        return ExecOutput {
+            stdout: String::new(),
+            stderr: format!("Impossible d'écrire le script temporaire: {e}"),
+            code: None,
+            timed_out: false,
+        };
+    }
+
+    let child = Command::new(interpreter)
+        .arg(&path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            return ExecOutput {
+                stdout: String::new(),
+                stderr: format!("Impossible de lancer {interpreter}: {e}"),
+                code: None,
+                timed_out: false,
+            };
+        }
+    };
+
+    // stdout/stderr lus dans des threads dédiés pour ne jamais bloquer sur
+    // un pipe plein pendant qu'on attend la fin du process.
+    let stdout_handle = child.stdout.take().map(|mut s| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = s.read_to_string(&mut buf);
+            buf
+        })
+    });
+    let stderr_handle = child.stderr.take().map(|mut s| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = s.read_to_string(&mut buf);
+            buf
+        })
+    });
+
+    let timeout = std::time::Duration::from_secs(30);
+    let start = std::time::Instant::now();
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    timed_out = true;
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
+            Err(_) => break None,
+        }
+    };
+
+    let stdout = stdout_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    let stderr = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    let code = status.and_then(|s| s.code());
+
+    let _ = std::fs::remove_file(&path);
+
+    ExecOutput {
+        stdout,
+        stderr,
+        code,
+        timed_out,
+    }
+}
+
 // ── App state (GUI-local) ─────────────────────────────────────────────────────
 
 struct RustmanApp {
@@ -113,6 +260,10 @@ struct RustmanApp {
     exploit_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     exploit_http_rx: Option<std::sync::mpsc::Receiver<(Vec<u8>, Vec<u8>)>>,
     exploit_thinking: bool,
+    exploit_exec_lang: ExecLang,
+    exploit_exec_running: bool,
+    exploit_exec_output: Option<ExecOutput>,
+    exploit_exec_rx: Option<mpsc::Receiver<ExecOutput>>,
     exploit_code: String,
     // Crawler auth credentials (submitted automatically on login pages).
     crawler_auth_user: String,
@@ -174,6 +325,10 @@ impl RustmanApp {
             exploit_http_rx: None,
             exploit_thinking: false,
             exploit_code: String::new(),
+            exploit_exec_lang: ExecLang::None,
+            exploit_exec_output: None,
+            exploit_exec_running: false,
+            exploit_exec_rx: None,
             crawler_auth_user: String::new(),
             crawler_auth_pass: String::new(),
             crawler_auth_user_field: String::new(),
@@ -197,6 +352,33 @@ impl RustmanApp {
             openapi_scanning: false,
             openapi_md_status: None,
         }
+    }
+
+    fn exploit_exec_run(&mut self) {
+        if self.exploit_exec_running {
+            return;
+        }
+        if self.exploit_exec_lang == ExecLang::None {
+            self.exploit_exec_output = Some(ExecOutput {
+                stdout: String::new(),
+                stderr: "Langage non pris en compte ou non détecté".into(),
+                code: None,
+                timed_out: false,
+            });
+            return;
+        }
+
+        let lang = self.exploit_exec_lang;
+        let code = self.exploit_code.clone();
+        let (tx, rx) = mpsc::channel();
+        self.exploit_exec_rx = Some(rx);
+        self.exploit_exec_running = true;
+        self.exploit_exec_output = None;
+
+        std::thread::spawn(move || {
+            let result = run_exec_script(lang, &code);
+            let _ = tx.send(result);
+        });
     }
 
     fn sync_selection(&mut self) {
@@ -353,7 +535,9 @@ impl RustmanApp {
     }
 
     fn poll_exploit_http(&mut self) -> bool {
-        let Some(rx) = &self.exploit_http_rx else { return false; };
+        let Some(rx) = &self.exploit_http_rx else {
+            return false;
+        };
         match rx.try_recv() {
             Ok((req_bytes, resp_bytes)) => {
                 self.exploit_http_rx = None;
@@ -1018,7 +1202,21 @@ impl RustmanApp {
                     .inner_margin(egui::Margin::symmetric(8.0, 6.0));
 
                 resp_frame.show(ui, |ui| {
-                    ui.colored_label(Color32::DARK_GRAY, "RESPONSE");
+                    ui.horizontal(|ui| {
+                        ui.colored_label(Color32::DARK_GRAY, "RESPONSE");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(4.0);
+                            let copy_btn = egui::Button::new(
+                                RichText::new("  Copy  ")
+                                    .size(11.0)
+                                    .color(Color32::from_rgb(220, 220, 220)),
+                            )
+                            .fill(Color32::from_rgb(50, 55, 70));
+                            if ui.add(copy_btn).on_hover_text("Copy response").clicked() {
+                                ui.output_mut(|o| o.copied_text = resp_text.clone());
+                            }
+                        });
+                    });
                     ui.add_space(4.0);
                     ScrollArea::vertical()
                         .id_salt("resp_text_scroll")
@@ -1028,7 +1226,7 @@ impl RustmanApp {
                             let te = TextEdit::multiline(&mut resp_clone)
                                 .font(egui::TextStyle::Monospace)
                                 .desired_width(f32::INFINITY)
-                                .interactive(false)
+                                .interactive(true)
                                 .frame(false)
                                 .text_color(Color32::from_rgb(180, 210, 180));
                             ui.add(te);
@@ -1256,6 +1454,18 @@ impl RustmanApp {
                         if sending {
                             ui.colored_label(Color32::from_rgb(255, 160, 60), "  ↻");
                         }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(4.0);
+                            let copy_btn = egui::Button::new(
+                                RichText::new("  Copy  ")
+                                    .size(11.0)
+                                    .color(Color32::from_rgb(220, 220, 220)),
+                            )
+                            .fill(Color32::from_rgb(50, 55, 70));
+                            if ui.add(copy_btn).on_hover_text("Copy response").clicked() {
+                                ui.output_mut(|o| o.copied_text = resp_text.clone());
+                            }
+                        });
                     });
                     ui.add_space(4.0);
                     ScrollArea::vertical()
@@ -1266,7 +1476,7 @@ impl RustmanApp {
                             let te = TextEdit::multiline(&mut resp_clone)
                                 .font(egui::TextStyle::Monospace)
                                 .desired_width(f32::INFINITY)
-                                .interactive(false)
+                                .interactive(true)
                                 .frame(false)
                                 .text_color(Color32::from_rgb(180, 210, 180));
                             ui.add(te);
@@ -1701,7 +1911,7 @@ impl RustmanApp {
                             TextEdit::multiline(&mut t)
                                 .font(egui::TextStyle::Monospace)
                                 .desired_width(f32::INFINITY)
-                                .interactive(false)
+                                .interactive(true)
                                 .frame(false)
                                 .text_color(Color32::from_rgb(210, 210, 220)),
                         );
@@ -1719,7 +1929,21 @@ impl RustmanApp {
                     .inner_margin(egui::Margin::symmetric(8.0, 6.0));
 
                 resp_frame.show(ui, |ui| {
-                    ui.colored_label(Color32::DARK_GRAY, "RESPONSE");
+                    ui.horizontal(|ui| {
+                        ui.colored_label(Color32::DARK_GRAY, "RESPONSE");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(4.0);
+                            let copy_btn = egui::Button::new(
+                                RichText::new("  Copy  ")
+                                    .size(11.0)
+                                    .color(Color32::from_rgb(220, 220, 220)),
+                            )
+                            .fill(Color32::from_rgb(50, 55, 70));
+                            if ui.add(copy_btn).on_hover_text("Copy response").clicked() {
+                                ui.output_mut(|o| o.copied_text = resp_text.clone());
+                            }
+                        });
+                    });
                     ui.add_space(4.0);
                     ScrollArea::vertical()
                         .id_salt(format!("crawl_resp_{idx}"))
@@ -1730,7 +1954,7 @@ impl RustmanApp {
                                 TextEdit::multiline(&mut t)
                                     .font(egui::TextStyle::Monospace)
                                     .desired_width(f32::INFINITY)
-                                    .interactive(false)
+                                    .interactive(true)
                                     .frame(false)
                                     .text_color(Color32::from_rgb(180, 210, 180)),
                             );
@@ -1870,9 +2094,25 @@ impl RustmanApp {
                         if ui.small_button("Copy").clicked() {
                             ui.output_mut(|o| o.copied_text = self.exploit_code.clone());
                         }
+                        ui.add_space(4.0);
+                        if ui.small_button("Exec").clicked() {
+                            self.exploit_exec_run();
+                        }
                     });
+
                 });
                 ui.separator();
+                egui::ComboBox::from_id_salt("exploit_exec_lang")
+                    .selected_text(match self.exploit_exec_lang {
+                        ExecLang::None => "None",
+                        ExecLang::Bash => "Bash",
+                        ExecLang::Python => "Python",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.exploit_exec_lang, ExecLang::None, "None");
+                        ui.selectable_value(&mut self.exploit_exec_lang, ExecLang::Bash, "Bash");
+                        ui.selectable_value(&mut self.exploit_exec_lang, ExecLang::Python, "Python");
+                    });
 
                 let avail_h = ui.available_height();
                 ScrollArea::vertical()
@@ -1939,7 +2179,6 @@ impl RustmanApp {
                                 );
                                 ui.add_space(8.0);
 
-                                // "⚡ Analyze" quick button
                                 let analyze_btn = egui::Button::new(
                                     RichText::new("  ⚡ Analyze  ")
                                         .size(11.0)
@@ -2033,12 +2272,27 @@ impl RustmanApp {
                                                     render_message_with_code(ui, &msg.text, i);
                                                 });
 
-                                            // "→ Editor" button if the message contains code
+                                            // Action buttons below each AI response
                                             let code = extract_code_blocks(&msg.text);
-                                            if !code.is_empty() {
-                                                ui.add_space(3.0);
-                                                ui.horizontal(|ui| {
-                                                    ui.add_space(2.0);
+                                            let msg_text = msg.text.clone();
+                                            ui.add_space(3.0);
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(2.0);
+                                                let copy_btn = egui::Button::new(
+                                                    RichText::new("  Copy  ")
+                                                        .size(11.0)
+                                                        .color(Color32::from_rgb(220, 220, 220)),
+                                                )
+                                                .fill(Color32::from_rgb(50, 55, 70));
+                                                if ui
+                                                    .add(copy_btn)
+                                                    .on_hover_text("Copy response (Ctrl+A Ctrl+C)")
+                                                    .clicked()
+                                                {
+                                                    ui.output_mut(|o| o.copied_text = msg_text);
+                                                }
+                                                if !code.is_empty() {
+                                                    ui.add_space(4.0);
                                                     let btn = egui::Button::new(
                                                         RichText::new("  → Editor  ")
                                                             .size(11.0)
@@ -2054,8 +2308,8 @@ impl RustmanApp {
                                                     {
                                                         send_to_editor = Some(code);
                                                     }
-                                                });
-                                            }
+                                                }
+                                            });
                                         });
                                     },
                                 );
@@ -2880,6 +3134,17 @@ impl RustmanApp {
                             ui.add_space(6.0);
                             ui.colored_label(sc_col,
                                 RichText::new(r.status.to_string()).strong().size(13.0));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let copy_btn = egui::Button::new(
+                                    RichText::new("  Copy  ")
+                                        .size(11.0)
+                                        .color(Color32::from_rgb(220, 220, 220)),
+                                )
+                                .fill(Color32::from_rgb(50, 55, 70));
+                                if ui.add(copy_btn).on_hover_text("Copy response").clicked() {
+                                    ui.output_mut(|o| o.copied_text = resp_text.clone());
+                                }
+                            });
                         });
                         egui::Frame::none()
                             .fill(Color32::from_rgb(14,18,20))
@@ -2907,7 +3172,7 @@ impl RustmanApp {
     /// Démarre le scan OpenAPI en background (comme le crawler).
     /// `ep_filter` = None → tous les endpoints, Some(i) → seulement l'endpoint i.
     fn start_openapi_scan(&mut self, ep_filter: Option<usize>) {
-        use crate::openapi::{ApiEndpoint, ParamLoc, ScanMsg, ScanResult};
+        use crate::openapi::{ApiEndpoint, ScanMsg};
         use std::sync::{
             atomic::{AtomicBool, Ordering},
             Arc,
@@ -3026,114 +3291,27 @@ impl RustmanApp {
 
                 handles.push(tokio::spawn(async move {
                     let _permit = permit;
-
-                    let mut params: Vec<(String, ParamLoc)> = ep2
-                        .body_fields
-                        .iter()
-                        .map(|f| (f.clone(), ParamLoc::Body))
-                        .chain(
-                            ep2.query_params
-                                .iter()
-                                .map(|q| (q.clone(), ParamLoc::Query)),
-                        )
-                        .chain(ep2.path_params.iter().map(|p| (p.clone(), ParamLoc::Path)))
-                        .collect();
-                    // Endpoint sans aucun paramètre détecté : on injecte via un
-                    // query param générique pour ne jamais laisser un endpoint non testé.
-                    if params.is_empty() {
-                        let fallback = if matches!(
-                            ep2.method.to_uppercase().as_str(),
-                            "POST" | "PUT" | "PATCH"
-                        ) {
-                            ("data".to_string(), ParamLoc::Body)
-                        } else {
-                            ("id".to_string(), ParamLoc::Query)
-                        };
-                        params.push(fallback);
-                    }
-
-                    let total_ep_payloads: usize = params.len()
-                        * payloads2
-                            .as_ref()
-                            .iter()
-                            .map(|(_, p)| p.len())
-                            .sum::<usize>();
-                    let mut processed = 0usize;
-
-                    'ep_loop: for (param, loc) in &params {
-                        for (cat, plist) in payloads2.as_ref() {
-                            if stop2.load(Ordering::Relaxed) {
-                                break 'ep_loop;
+                    // Détection déléguée à la logique partagée (baseline +
+                    // confirmation + gardes de réflexion → ~0 faux positif).
+                    crate::openapi::scan_one_endpoint(
+                        &ep2,
+                        ep_idx,
+                        &host2,
+                        port,
+                        tls,
+                        &creds2,
+                        payloads2.as_ref(),
+                        &stop2,
+                        |ev| match ev {
+                            crate::openapi::ScanEvent::Result(r) => {
+                                let _ = tx2.send(ScanMsg::Result(r));
                             }
-
-                            let display_cat = crate::openapi::payload_cat_name(cat).to_string();
-
-                            for payload in plist {
-                                if stop2.load(Ordering::Relaxed) {
-                                    break 'ep_loop;
-                                }
-                                processed += 1;
-
-                                let raw = ep2.build_request_fuzzed(
-                                    &host2,
-                                    port,
-                                    tls,
-                                    creds2.cookie.as_deref().unwrap_or(""),
-                                    creds2.bearer.as_deref().unwrap_or(""),
-                                    creds2.api_key_header.as_deref().unwrap_or(""),
-                                    creds2.api_key_value.as_deref().unwrap_or(""),
-                                    param,
-                                    loc,
-                                    payload,
-                                );
-                                let raw_request = raw.clone();
-                                let resp_bytes =
-                                    crate::proxy::repeater_send(&host2, port, tls, raw).await;
-                                let status: u16 = std::str::from_utf8(&resp_bytes)
-                                    .unwrap_or("")
-                                    .lines()
-                                    .next()
-                                    .and_then(|l| l.split_whitespace().nth(1))
-                                    .and_then(|s| s.parse().ok())
-                                    .unwrap_or(0);
-
-                                let evidence = {
-                                    let ev = crate::rapport::check_reflected(
-                                        &display_cat,
-                                        payload,
-                                        &resp_bytes,
-                                        None,
-                                    );
-                                    if crate::rapport::is_false_positive(&display_cat, status) {
-                                        None
-                                    } else {
-                                        ev
-                                    }
-                                };
-
-                                let vuln_confirmed = evidence.is_some();
-                                let _ = tx2.send(ScanMsg::Result(ScanResult {
-                                    ep_idx,
-                                    param: param.clone(),
-                                    loc: loc.clone(),
-                                    category: display_cat.clone(),
-                                    payload: payload.clone(),
-                                    status,
-                                    response: resp_bytes,
-                                    evidence,
-                                    raw_request,
-                                }));
-
-                                if vuln_confirmed {
-                                    let remaining = total_ep_payloads - processed;
-                                    if remaining > 0 {
-                                        let _ = tx2.send(ScanMsg::Skipped(remaining));
-                                    }
-                                    break 'ep_loop;
-                                }
+                            crate::openapi::ScanEvent::Skipped(n) => {
+                                let _ = tx2.send(ScanMsg::Skipped(n));
                             }
-                        }
-                    }
+                        },
+                    )
+                    .await;
                 }));
             }
 
@@ -3713,7 +3891,7 @@ fn days_since_epoch(mut days: u64) -> (u64, u64) {
 fn category_severity(cat: &str) -> &'static str {
     match cat {
         "CMDi" | "RCE" => "🔴 Critique",
-        "SQLi" | "PathTraversal" => "🔴 Élevée",
+        "SQLi" | "NoSQLi" | "PathTraversal" => "🔴 Élevée",
         "SSRF" | "SSTI" => "🟠 Élevée",
         "XSS" => "🟡 Moyenne",
         "OpenRedirect" => "🟡 Faible",
@@ -3742,6 +3920,13 @@ Toujours utiliser des requêtes préparées (prepared statements) avec des param
 - Appliquer le principe de moindre privilège sur le compte de base de données.\n\
 - Activer le mode strict de l'ORM si applicable.\n\
 - Ne jamais exposer les messages d'erreur SQL à l'utilisateur final.",
+
+        "NoSQLi" => "\
+Ne jamais construire une requête NoSQL à partir d'entrées utilisateur non validées.\n\
+- Forcer le typage des entrées : rejeter les objets/opérateurs (`$ne`, `$gt`, `$where`, `$regex`) là où une chaîne est attendue.\n\
+- Utiliser un ODM avec schéma strict (Mongoose `strict`/`sanitizeFilter`, ou `express-mongo-sanitize`).\n\
+- Désactiver l'exécution de JavaScript côté serveur (`$where`, `mapReduce`) via `--noscripting`.\n\
+- Ne jamais exposer les messages d'erreur du driver à l'utilisateur final.",
 
         "PathTraversal" => "\
 Valider et normaliser tout chemin de fichier avant utilisation.\n\

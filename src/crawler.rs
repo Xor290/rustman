@@ -261,12 +261,10 @@ pub async fn run(
         let resp = crate::proxy::repeater_send(&host, port, tls, request_bytes).await;
         let (status, body) = split_response(&resp);
 
-        // 401 with no auth yet → queue URL for retry once credentials are acquired.
         if status == 401 && !has_auth {
             retry_after_auth.push((url.clone(), depth));
         }
 
-        // ── Auto-login: detect login form and submit credentials once ─────────
         if !logged_in {
             if let Some(ref auth) = config.auth {
                 if !auth.username.is_empty() {
@@ -506,6 +504,339 @@ pub async fn run(
     }
 
     let _ = tx.send(CrawlMsg::Finished);
+}
+
+// ── Adaptateur HAR → endpoints scannables ─────────────────────────────────────
+
+/// Construit une liste d'endpoints scannables à partir d'un fichier **HAR**
+/// (HTTP Archive) exporté par un navigateur / proxy. C'est le vecteur qui couvre
+/// les endpoints d'une SPA : chaque appel XHR capturé (y compris POST/PUT avec
+/// corps JSON, et chemins avec identifiants) devient un endpoint fuzzé par le
+/// même pipeline ~0 FP. `base_host` filtre les entrées (on ne scanne que la
+/// cible), vide = toutes.
+pub fn endpoints_from_har(
+    har: &str,
+    base_host: &str,
+) -> Result<Vec<crate::openapi::ApiEndpoint>, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(har).map_err(|e| format!("HAR invalide : {e}"))?;
+    let entries = v
+        .get("log")
+        .and_then(|l| l.get("entries"))
+        .and_then(|e| e.as_array())
+        .ok_or("HAR : champ log.entries introuvable")?;
+
+    let mut eps = Vec::new();
+    for entry in entries {
+        let Some(req) = entry.get("request") else {
+            continue;
+        };
+        let method = req
+            .get("method")
+            .and_then(|m| m.as_str())
+            .unwrap_or("GET")
+            .to_ascii_uppercase();
+        let Some(url) = req.get("url").and_then(|u| u.as_str()) else {
+            continue;
+        };
+        // Filtre d'hôte : ne garder que la cible.
+        if !base_host.is_empty() {
+            match parse_url_parts(url) {
+                Some((h, _, _, _)) if h.eq_ignore_ascii_case(base_host) => {}
+                _ => continue,
+            }
+        }
+        let content_type = req
+            .get("headers")
+            .and_then(|h| h.as_array())
+            .and_then(|hs| {
+                hs.iter().find_map(|hh| {
+                    let name = hh.get("name").and_then(|n| n.as_str())?;
+                    if name.eq_ignore_ascii_case("content-type") {
+                        hh.get("value").and_then(|v| v.as_str())
+                    } else {
+                        None
+                    }
+                })
+            })
+            .unwrap_or("");
+        let body = req
+            .get("postData")
+            .and_then(|p| p.get("text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+
+        if let Some(ep) = endpoint_from_parts(&method, &url_to_target(url), content_type, body) {
+            eps.push(ep);
+        }
+    }
+    Ok(finalize_endpoints(eps))
+}
+
+/// Extrait les credentials de session d'un HAR : le token Bearer et le cookie
+/// les plus fréquents parmi les requêtes capturées. Permet un scan authentifié
+/// après un crawl avec login scripté (le token acquis est rejoué sur le scan).
+pub fn har_auth(har: &str) -> (Option<String>, Option<String>) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(har) else {
+        return (None, None);
+    };
+    let Some(entries) = v
+        .get("log")
+        .and_then(|l| l.get("entries"))
+        .and_then(|e| e.as_array())
+    else {
+        return (None, None);
+    };
+    use std::collections::HashMap;
+    let mut bearers: HashMap<String, usize> = HashMap::new();
+    let mut cookies: HashMap<String, usize> = HashMap::new();
+    for entry in entries {
+        let Some(headers) = entry
+            .get("request")
+            .and_then(|r| r.get("headers"))
+            .and_then(|h| h.as_array())
+        else {
+            continue;
+        };
+        for h in headers {
+            let name = h.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            let value = h.get("value").and_then(|v| v.as_str()).unwrap_or("");
+            if name.eq_ignore_ascii_case("authorization") {
+                let tok = value
+                    .strip_prefix("Bearer ")
+                    .or_else(|| value.strip_prefix("bearer "))
+                    .unwrap_or("");
+                if !tok.is_empty() {
+                    *bearers.entry(tok.to_string()).or_default() += 1;
+                }
+            } else if name.eq_ignore_ascii_case("cookie") && !value.is_empty() {
+                *cookies.entry(value.to_string()).or_default() += 1;
+            }
+        }
+    }
+    let top = |m: HashMap<String, usize>| m.into_iter().max_by_key(|(_, c)| *c).map(|(k, _)| k);
+    (top(bearers), top(cookies))
+}
+
+/// Origine (`scheme://host[:port]`) de la première requête d'un HAR — sert de
+/// cible par défaut quand `--target` n'est pas fourni.
+pub fn har_base_url(har: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(har).ok()?;
+    let url = v
+        .get("log")?
+        .get("entries")?
+        .as_array()?
+        .iter()
+        .find_map(|e| e.get("request")?.get("url")?.as_str())?;
+    let (scheme, rest) = url.split_once("://")?;
+    let origin = rest.split('/').next().unwrap_or(rest);
+    Some(format!("{scheme}://{origin}"))
+}
+
+/// `/path?query` d'une URL absolue (scheme + host retirés).
+fn url_to_target(url: &str) -> String {
+    let after = url.splitn(2, "://").nth(1).unwrap_or(url);
+    match after.find('/') {
+        Some(i) => after[i..].to_string(),
+        None => "/".to_string(),
+    }
+}
+
+/// Déduplication + filtres de sûreté partagés par les adaptateurs crawler et HAR.
+fn finalize_endpoints(eps: Vec<crate::openapi::ApiEndpoint>) -> Vec<crate::openapi::ApiEndpoint> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for ep in eps {
+        if is_destructive(&ep.method, &ep.path) || is_noise_path(&ep.path) {
+            continue;
+        }
+        let mut names: Vec<String> = ep
+            .query_params
+            .iter()
+            .chain(ep.body_fields.iter())
+            .chain(ep.path_params.iter())
+            .cloned()
+            .collect();
+        if names.is_empty() {
+            continue;
+        }
+        names.sort();
+        names.dedup();
+        let key = format!("{} {} [{}]", ep.method, ep.path, names.join(","));
+        if seen.insert(key) {
+            out.push(ep);
+        }
+    }
+    out
+}
+
+/// Construit un endpoint à partir de composants HTTP décodés (utilisé par
+/// l'import HAR). Ne retient que les méthodes injectables.
+fn endpoint_from_parts(
+    method: &str,
+    target: &str,
+    content_type: &str,
+    body: &str,
+) -> Option<crate::openapi::ApiEndpoint> {
+    if !matches!(method, "GET" | "POST" | "PUT" | "PATCH") {
+        return None;
+    }
+    let (raw_path, query) = match target.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (target, ""),
+    };
+    let query_params = query_param_names(query);
+    // Segments ressemblant à un identifiant → paramètres de chemin fuzzables :
+    // `/api/Products/1` → `/api/Products/{p1}`.
+    let (path, path_params) = templatize_path(raw_path);
+
+    let mut body_fields = Vec::new();
+    if matches!(method, "POST" | "PUT" | "PATCH") && !body.is_empty() {
+        let ct = content_type.to_ascii_lowercase();
+        let trimmed = body.trim_start();
+        if ct.contains("application/json") || trimmed.starts_with('{') {
+            if let Ok(serde_json::Value::Object(map)) =
+                serde_json::from_str::<serde_json::Value>(trimmed)
+            {
+                body_fields = map.keys().cloned().collect();
+            }
+        } else {
+            body_fields = query_param_names(body);
+        }
+    }
+
+    Some(crate::openapi::ApiEndpoint {
+        method: method.to_string(),
+        path,
+        query_params,
+        body_fields,
+        path_params,
+    })
+}
+
+/// Remplace chaque segment de chemin ressemblant à un identifiant de ressource
+/// (numérique, UUID, hash hex, ObjectId…) par un placeholder `{pN}` fuzzable, et
+/// renvoie la liste des noms de paramètres créés. Conservateur pour rester ~0 FP :
+/// on ne transforme pas les segments alphabétiques (noms de collection type
+/// `Products`), seulement ceux qui ont une forme d'ID.
+fn templatize_path(path: &str) -> (String, Vec<String>) {
+    let mut params: Vec<String> = Vec::new();
+    let rebuilt: Vec<String> = path
+        .split('/')
+        .map(|seg| {
+            if looks_like_id_segment(seg) {
+                let name = format!("p{}", params.len() + 1);
+                params.push(name.clone());
+                format!("{{{name}}}")
+            } else {
+                seg.to_string()
+            }
+        })
+        .collect();
+    (rebuilt.join("/"), params)
+}
+
+/// `true` si un segment de chemin a la forme d'un identifiant de ressource.
+fn looks_like_id_segment(seg: &str) -> bool {
+    if seg.is_empty() {
+        return false;
+    }
+    // Entièrement numérique (ex: 1, 42, 1000).
+    if seg.bytes().all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    // UUID canonique 8-4-4-4-12.
+    let uuid_shape = [8usize, 4, 4, 4, 12];
+    let groups: Vec<&str> = seg.split('-').collect();
+    if groups.len() == 5
+        && groups
+            .iter()
+            .zip(uuid_shape.iter())
+            .all(|(g, &n)| g.len() == n && g.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return true;
+    }
+    // Hash / ObjectId : longue chaîne purement hexadécimale (>=16), ou token
+    // long alphanumérique contenant au moins un chiffre (évite les mots purs).
+    if seg.len() >= 16 && seg.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return true;
+    }
+    if seg.len() >= 20
+        && seg.bytes().all(|b| b.is_ascii_alphanumeric())
+        && seg.bytes().any(|b| b.is_ascii_digit())
+    {
+        return true;
+    }
+    false
+}
+
+/// Noms de paramètres d'une query string `a=1&b=2` → `["a", "b"]` (dédupliqués).
+fn query_param_names(q: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for pair in q.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let name = pair.split('=').next().unwrap_or("");
+        if !name.is_empty() && !names.iter().any(|n| n == name) {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+/// `true` pour un chemin qui n'est pas un endpoint applicatif à fuzzer : bruit de
+/// transport (socket.io) ou asset statique (JS/CSS/images/polices…). Évite de
+/// scanner le fallback HTML d'une SPA et le protocole temps-réel.
+fn is_noise_path(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    if p.contains("/socket.io/") || p.contains("/sockjs") {
+        return true;
+    }
+    const EXT: &[&str] = &[
+        ".js",
+        ".mjs",
+        ".css",
+        ".map",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".svg",
+        ".ico",
+        ".woff",
+        ".woff2",
+        ".ttf",
+        ".eot",
+        ".webp",
+        ".mp4",
+        ".mp3",
+        ".pdf",
+        ".zip",
+        ".webmanifest",
+    ];
+    EXT.iter().any(|e| p.ends_with(e))
+}
+
+/// `true` pour un endpoint dont l'injection risquerait de modifier/détruire
+/// l'état de la cible : à ne pas fuzzer automatiquement.
+fn is_destructive(method: &str, path: &str) -> bool {
+    if method == "DELETE" {
+        return true;
+    }
+    let p = path.to_ascii_lowercase();
+    const DANGER: &[&str] = &[
+        "logout",
+        "signout",
+        "sign-out",
+        "log-out",
+        "delete",
+        "remove",
+        "destroy",
+        "deactivate",
+        "unsubscribe",
+    ];
+    DANGER.iter().any(|d| p.contains(d))
 }
 
 // ── Request / session helpers ─────────────────────────────────────────────────
@@ -1246,9 +1577,73 @@ pub fn extract_api_routes_from_js(js: &str) -> Vec<String> {
         }
     }
 
+    // Embedded paths carrying a query string — captured even inside template
+    // literals / concatenations that `looks_like_api_path` rejects because of a
+    // `${…}` interpolation. e.g. `${host}/rest/products/search?q=${e}` yields
+    // `/rest/products/search?q=test`. High-signal: a discovered query parameter
+    // is directly injectable, which is how SPA endpoints (Angular/React) expose
+    // their fuzzable surface.
+    let bytes = js.as_bytes();
+    for prefix in PATH_PREFIXES {
+        let mut pos = 0;
+        while let Some(i) = js[pos..].find(prefix) {
+            let start = pos + i;
+            pos = start + 1;
+            // The prefix must begin a real path segment (left boundary), so we
+            // don't capture `/search` out of `.../products/search`.
+            if start > 0 {
+                let prev = bytes[start - 1];
+                if prev.is_ascii_alphanumeric() || matches!(prev, b'/' | b'.' | b'-' | b'_') {
+                    continue;
+                }
+            }
+            if let Some(route) = normalize_query_route(read_url_run(&js[start..])) {
+                routes.push(route);
+            }
+        }
+    }
+
     routes.sort();
     routes.dedup();
     routes
+}
+
+/// Reads the leading URL-ish run of a string: path/query characters up to the
+/// first non-URL byte (`$`, backtick, quote, whitespace, `+`, …).
+fn read_url_run(s: &str) -> &str {
+    let end = s
+        .find(|c: char| {
+            !(c.is_ascii_alphanumeric()
+                || matches!(c, '/' | '_' | '-' | '.' | '~' | '?' | '=' | '&' | '%'))
+        })
+        .unwrap_or(s.len());
+    &s[..end]
+}
+
+/// Keeps only routes that carry a query string, replacing each value (often a cut
+/// `${…}` interpolation) with a benign one so the parameter name is preserved.
+/// `/rest/products/search?q=` → `/rest/products/search?q=test`.
+fn normalize_query_route(run: &str) -> Option<String> {
+    let (path, query) = run.split_once('?')?;
+    if !path.starts_with('/') || path.len() < 2 {
+        return None;
+    }
+    let mut names: Vec<&str> = Vec::new();
+    for pair in query.split('&') {
+        let name = pair.split('=').next().unwrap_or("");
+        if !name.is_empty() && !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    if names.is_empty() {
+        return None;
+    }
+    let q = names
+        .iter()
+        .map(|n| format!("{n}=test"))
+        .collect::<Vec<_>>()
+        .join("&");
+    Some(format!("{path}?{q}"))
 }
 
 /// Find the next string literal (starting with `"`, `'`, or `` ` ``) at or after `start`,

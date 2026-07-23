@@ -17,9 +17,8 @@ use std::sync::{Arc, Mutex};
 
 fn main() {
     // ── CLI flag detection (before any output) ────────────────────────────────
-    let is_cli = std::env::args().any(|a| {
-        matches!(a.as_str(), "--openapi" | "--scan" | "--help" | "-h")
-    });
+    let is_cli =
+        std::env::args().any(|a| matches!(a.as_str(), "--openapi" | "--crawl" | "--help" | "-h"));
 
     // On Windows, re-attach to the parent console so that stdout/stderr work
     // when the binary is run from cmd.exe or PowerShell with CLI flags.
@@ -30,7 +29,7 @@ fn main() {
 
     // ── CI/CD headless mode ───────────────────────────────────────────────────
     if std::env::args().any(|a| a == "--help" || a == "-h")
-        && !std::env::args().any(|a| a == "--scan" || a == "--openapi")
+        && !std::env::args().any(|a| a == "--openapi" || a == "--crawl" || a == "--import")
     {
         cli::print_usage();
         std::process::exit(0);
@@ -41,7 +40,11 @@ fn main() {
             .install_default()
             .expect("failed to install ring crypto provider");
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-        let code = rt.block_on(cli::run(args));
+        let code = if args.crawl.is_some() {
+            rt.block_on(cli::run_crawl(args))
+        } else {
+            rt.block_on(cli::run(args))
+        };
         std::process::exit(code);
     }
 

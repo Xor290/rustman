@@ -12,7 +12,9 @@ pub enum OutputFormat {
 }
 
 pub struct CliArgs {
-    pub openapi_file: String,
+    pub openapi_file: Option<String>,
+    pub crawl: Option<String>,
+    pub crawl_depth: usize,
     pub target: Option<String>,
     pub payload_dir: String,
     pub output: Option<String>,
@@ -25,13 +27,12 @@ pub struct CliArgs {
     pub api_key_value: Option<String>,
 }
 
-/// Returns `Some(CliArgs)` when the binary is invoked with `--scan`, `None` to
 /// fall through to GUI mode.
 pub fn parse_args() -> Option<CliArgs> {
     let args: Vec<String> = std::env::args().collect();
 
-    // Trigger CLI mode with --scan or --openapi <file>
-    let scan_mode = args.iter().any(|a| a == "--scan" || a == "--openapi");
+    // Trigger CLI mode with --openapi, --crawl or --import
+    let scan_mode = args.iter().any(|a| a == "--openapi" || a == "--crawl");
     if !scan_mode {
         return None;
     }
@@ -41,10 +42,15 @@ pub fn parse_args() -> Option<CliArgs> {
     };
     let has = |flag: &str| args.iter().any(|a| a == flag);
 
-    let openapi_file = get("--openapi").unwrap_or_else(|| {
-        eprintln!("error: --openapi <file> is required");
+    let crawl = get("--crawl");
+    let openapi_file = get("--openapi");
+    if crawl.is_none() && openapi_file.is_none() {
+        eprintln!("error: provide --openapi <file>, --crawl <url> or --import <file.har>");
         std::process::exit(2);
-    });
+    }
+    let crawl_depth = get("--crawl-depth")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
 
     let output = get("--output");
 
@@ -82,6 +88,8 @@ pub fn parse_args() -> Option<CliArgs> {
 
     Some(CliArgs {
         openapi_file,
+        crawl,
+        crawl_depth,
         target: get("--target"),
         payload_dir,
         output,
@@ -96,10 +104,15 @@ pub fn parse_args() -> Option<CliArgs> {
 }
 
 pub fn print_usage() {
-    eprintln!("Usage: rustman --scan --openapi <spec.(json|yaml)> --target <url> [OPTIONS]");
+    eprintln!("Usage: rustman --openapi <spec.(json|yaml)> --target <url> [OPTIONS]");
+    eprintln!("       rustman --crawl <url> [OPTIONS]");
+    eprintln!();
+    eprintln!("Modes (one required):");
+    eprintln!("  --openapi <file>          Scan endpoints from an OpenAPI / Swagger spec");
+    eprintln!("  --crawl <url>             Crawl the site and list visited pages (no vuln scan)");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --openapi <file>          OpenAPI / Swagger spec (JSON or YAML)  [required]");
+    eprintln!("  --crawl-depth <n>         Max crawl depth (crawl mode)  [default: 3]");
     eprintln!("  --target <url>            Target base URL (overrides spec servers[0])");
     eprintln!(
         "  --payload-dir <dir>       Directory containing payload JSON files  [default: ./payload]"
@@ -122,12 +135,38 @@ pub fn print_usage() {
 
 // ── Headless scan ─────────────────────────────────────────────────────────────
 
+/// Fusionne les credentials du spec avec les surcharges de la ligne de commande.
+fn creds_from_args(
+    args: &CliArgs,
+    spec_creds: Option<crate::openapi::Credentials>,
+) -> crate::openapi::Credentials {
+    let mut c = spec_creds.unwrap_or_default();
+    if let Some(b) = &args.bearer {
+        c.bearer = Some(b.clone());
+    }
+    if let Some(k) = &args.cookie {
+        c.cookie = Some(k.clone());
+    }
+    if let Some(h) = &args.api_key_header {
+        c.api_key_header = Some(h.clone());
+    }
+    if let Some(v) = &args.api_key_value {
+        c.api_key_value = Some(v.clone());
+    }
+    c
+}
+
+/// Mode OpenAPI : construit les endpoints depuis un spec puis lance le scan.
 pub async fn run(args: CliArgs) -> i32 {
-    // ── Parse spec ─────────────────────────────────────────────────────────────
-    let spec_text = match std::fs::read_to_string(&args.openapi_file) {
+    let Some(spec_path) = args.openapi_file.clone() else {
+        eprintln!("error: --openapi <file> is required");
+        return 2;
+    };
+
+    let spec_text = match std::fs::read_to_string(&spec_path) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("error: cannot read {}: {e}", args.openapi_file);
+            eprintln!("error: cannot read {spec_path}: {e}");
             return 3;
         }
     };
@@ -141,30 +180,232 @@ pub async fn run(args: CliArgs) -> i32 {
     };
 
     // Resolve target: CLI flag > spec servers[0] > error
-    let target = args.target.or(parsed.server_url).unwrap_or_else(|| {
-        eprintln!("error: no --target provided and spec has no servers[0]");
-        std::process::exit(2);
-    });
+    let target = args
+        .target
+        .clone()
+        .or(parsed.server_url)
+        .unwrap_or_else(|| {
+            eprintln!("error: no --target provided and spec has no servers[0]");
+            std::process::exit(2);
+        });
 
-    let creds = {
-        let mut c = parsed.credentials.unwrap_or_default();
-        if let Some(b) = args.bearer {
-            c.bearer = Some(b);
-        }
-        if let Some(k) = args.cookie {
-            c.cookie = Some(k);
-        }
-        if let Some(h) = args.api_key_header {
-            c.api_key_header = Some(h);
-        }
-        if let Some(v) = args.api_key_value {
-            c.api_key_value = Some(v);
-        }
-        c
+    let creds = creds_from_args(&args, parsed.credentials);
+    let label = format!("spec:{spec_path}");
+    scan_and_report(parsed.endpoints, target, creds, &args, &label).await
+}
+
+/// Mode crawler : parcourt le site et génère un rapport de découverte (pages
+/// visitées). Pure exploration — aucune extraction de paramètres injectables
+/// ni test d'injection. Pour scanner un site, utiliser `--openapi` ou `--import`.
+pub async fn run_crawl(args: CliArgs) -> i32 {
+    let Some(start) = args.crawl.clone() else {
+        eprintln!("error: --crawl <url> is required");
+        return 2;
+    };
+    let target = args.target.clone().unwrap_or_else(|| start.clone());
+
+    eprintln!("[rustman] crawl start   : {start}");
+    eprintln!("[rustman] crawl depth   : {}", args.crawl_depth);
+    eprintln!("[rustman] crawling…");
+
+    let entries = run_crawler_collect(start.clone(), args.crawl_depth).await;
+    eprintln!("[rustman] crawl done    : {} pages visited", entries.len());
+
+    let report = match &args.format {
+        OutputFormat::Markdown => build_crawl_markdown(&target, &entries),
+        OutputFormat::Json => build_crawl_json(&target, &entries),
     };
 
-    let endpoints = parsed.endpoints;
+    match &args.output {
+        Some(path) => {
+            if let Err(e) = std::fs::write(path, &report) {
+                eprintln!("error: cannot write report to {path}: {e}");
+                return 3;
+            }
+            eprintln!("[rustman] report written to {path}");
+        }
+        None => print!("{report}"),
+    }
 
+    0
+}
+
+/// Extrait `(method, target)` de la ligne de requête HTTP brute (première ligne).
+fn request_line(req: &[u8]) -> (String, String) {
+    let text = String::from_utf8_lossy(req);
+    let first = text.lines().next().unwrap_or("");
+    let mut it = first.split_whitespace();
+    let method = it.next().unwrap_or("-").to_string();
+    let target = it.next().unwrap_or("-").to_string();
+    (method, target)
+}
+
+fn build_crawl_json(target: &str, entries: &[crate::crawler::CrawlerEntry]) -> String {
+    use crate::crawler::EntryStatus;
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let pages: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|e| {
+            let (method, req_target) = request_line(&e.request);
+            let (status, new_links) = match e.status {
+                EntryStatus::Done(s, n) => (Some(s), Some(n)),
+                _ => (None, None),
+            };
+            let error = match &e.status {
+                EntryStatus::Failed(msg) => Some(msg.clone()),
+                _ => None,
+            };
+            serde_json::json!({
+                "url": e.url,
+                "method": method,
+                "request_target": req_target,
+                "depth": e.depth,
+                "status": status,
+                "new_links_enqueued": new_links,
+                "error": error,
+            })
+        })
+        .collect();
+
+    let report = serde_json::json!({
+        "tool": "rustman",
+        "mode": "crawl",
+        "scan_date_unix": ts,
+        "target": target,
+        "pages_visited": pages.len(),
+        "pages": pages,
+    });
+
+    serde_json::to_string_pretty(&report).unwrap_or_default()
+}
+
+fn build_crawl_markdown(target: &str, entries: &[crate::crawler::CrawlerEntry]) -> String {
+    use crate::crawler::EntryStatus;
+    use std::fmt::Write;
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let (y, mo, d, h, mi, s) = unix_to_hms(ts);
+
+    let mut md = String::new();
+
+    let _ = writeln!(md, "# Crawl Report — Rustman Crawler");
+    let _ = writeln!(md);
+    let _ = writeln!(md, "| Field | Value |");
+    let _ = writeln!(md, "|---|---|");
+    let _ = writeln!(md, "| **Target** | `{target}` |");
+    let _ = writeln!(
+        md,
+        "| **Date** | {y}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC |"
+    );
+    let _ = writeln!(md, "| **Pages visited** | {} |", entries.len());
+    let _ = writeln!(md);
+    let _ = writeln!(
+        md,
+        "> Ce rapport liste les pages découvertes par le crawler. \
+Aucune extraction de paramètres ni test d'injection n'est effectué — utiliser `--openapi` ou `--import` pour lancer un scan de vulnérabilités."
+    );
+    let _ = writeln!(md);
+
+    let _ = writeln!(md, "## Pages visitées");
+    let _ = writeln!(md);
+    let _ = writeln!(md, "| Method | URL | Depth | Status |");
+    let _ = writeln!(md, "|---|---|---|---|");
+    for e in entries {
+        let (method, _) = request_line(&e.request);
+        let status_s = match &e.status {
+            EntryStatus::Done(code, _) => code.to_string(),
+            EntryStatus::Failed(msg) => format!("error: {msg}"),
+            EntryStatus::Fetching => "…".to_string(),
+        };
+        let _ = writeln!(
+            md,
+            "| {} | `{}` | {} | {} |",
+            method,
+            e.url,
+            e.depth,
+            status_s.replace('|', "\\|")
+        );
+    }
+    let _ = writeln!(md);
+    let _ = writeln!(md, "---");
+    let _ = writeln!(md, "*Generated by **Rustman** — Crawler (discovery only)*");
+
+    md
+}
+
+/// Lance le crawler et collecte les requêtes émises (Visiting + FormSubmit).
+async fn run_crawler_collect(start: String, depth: usize) -> Vec<crate::crawler::CrawlerEntry> {
+    use crate::crawler::{CrawlMsg, CrawlerConfig, CrawlerEntry, EntryStatus};
+
+    let (tx, rx) = std::sync::mpsc::sync_channel::<CrawlMsg>(1024);
+    let stop = Arc::new(AtomicBool::new(false));
+    let crawl_task = tokio::spawn(crate::crawler::run(
+        start,
+        depth,
+        stop,
+        tx,
+        CrawlerConfig::default(),
+    ));
+
+    // Le récepteur std est bloquant : on draine sur le pool blocking pour ne pas
+    // bloquer un worker async pendant que le crawler tourne.
+    let entries = tokio::task::spawn_blocking(move || {
+        let mut entries: Vec<CrawlerEntry> = Vec::new();
+        while let Ok(msg) = rx.recv() {
+            match msg {
+                CrawlMsg::Visiting {
+                    url,
+                    depth,
+                    request,
+                } => entries.push(CrawlerEntry {
+                    url,
+                    depth,
+                    status: EntryStatus::Fetching,
+                    request,
+                    response: Vec::new(),
+                }),
+                CrawlMsg::FormSubmit {
+                    action_url,
+                    request,
+                    status,
+                    response,
+                } => entries.push(CrawlerEntry {
+                    url: action_url,
+                    depth: 0,
+                    status: EntryStatus::Done(status, 0),
+                    request,
+                    response,
+                }),
+                CrawlMsg::Finished => break,
+                _ => {}
+            }
+        }
+        entries
+    })
+    .await
+    .unwrap_or_default();
+
+    let _ = crawl_task.await;
+    entries
+}
+
+/// Orchestration commune : charge les payloads, scanne les endpoints via le
+/// pipeline partagé, génère le rapport. Utilisé par les modes OpenAPI et crawler.
+async fn scan_and_report(
+    endpoints: Vec<ApiEndpoint>,
+    target: String,
+    creds: crate::openapi::Credentials,
+    args: &CliArgs,
+    source_label: &str,
+) -> i32 {
     // ── Load payloads ──────────────────────────────────────────────────────────
     let payloads = crate::openapi::load_payloads(&args.payload_dir);
     if payloads.is_empty() {
@@ -186,7 +427,7 @@ pub async fn run(args: CliArgs) -> i32 {
         .sum();
 
     eprintln!("[rustman] target        : {target}");
-    eprintln!("[rustman] spec          : {}", args.openapi_file);
+    eprintln!("[rustman] source        : {source_label}");
     eprintln!("[rustman] endpoints     : {}", endpoints.len());
     eprintln!("[rustman] payload cats  : {}", payloads.len());
     eprintln!("[rustman] max requests  : {total_requests}");
@@ -203,9 +444,11 @@ pub async fn run(args: CliArgs) -> i32 {
     let stop = Arc::new(AtomicBool::new(false));
     let sem = Arc::new(tokio::sync::Semaphore::new(args.concurrency));
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<ScanResult>(4096);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ScanResult>();
 
-    // Spawn one task per endpoint (same pattern as the GUI scan).
+    // Spawn one task per endpoint (same pattern as the GUI scan). The per-endpoint
+    // detection logic lives in the shared `openapi::scan_one_endpoint` so the
+    // OpenAPI and crawler scanners share the exact same 0-FP pipeline.
     let mut handles = Vec::new();
     for (ep_idx, ep) in endpoints.iter().cloned().enumerate() {
         if stop.load(Ordering::Relaxed) {
@@ -223,85 +466,27 @@ pub async fn run(args: CliArgs) -> i32 {
 
         handles.push(tokio::spawn(async move {
             let _permit = permit;
-
-            let mut params: Vec<(String, ParamLoc)> = ep.body_fields.iter()
-                .map(|f| (f.clone(), ParamLoc::Body))
-                .chain(ep.query_params.iter().map(|q| (q.clone(), ParamLoc::Query)))
-                .chain(ep.path_params.iter().map(|p| (p.clone(), ParamLoc::Path)))
-                .collect();
-            if params.is_empty() {
-                let fallback = if matches!(ep.method.to_uppercase().as_str(), "POST"|"PUT"|"PATCH") {
-                    ("data".to_string(), ParamLoc::Body)
-                } else {
-                    ("id".to_string(), ParamLoc::Query)
-                };
-                params.push(fallback);
-            }
-
-            let total_ep_payloads: usize = params.len()
-                * payloads2.as_ref().iter().map(|(_, p)| p.len()).sum::<usize>();
-            let mut processed = 0usize;
-
-            'ep_loop: for (param, loc) in &params {
-                for (cat, plist) in payloads2.as_ref() {
-                    if stop2.load(Ordering::Relaxed) { break 'ep_loop; }
-
-                    let display_cat = crate::openapi::payload_cat_name(cat).to_string();
-
-                    for payload in plist {
-                        if stop2.load(Ordering::Relaxed) { break 'ep_loop; }
-                        processed += 1;
-
-                        let raw = ep.build_request_fuzzed(
-                            &host2, port, tls,
-                            creds2.cookie.as_deref().unwrap_or(""),
-                            creds2.bearer.as_deref().unwrap_or(""),
-                            creds2.api_key_header.as_deref().unwrap_or(""),
-                            creds2.api_key_value.as_deref().unwrap_or(""),
-                            param, loc, payload,
-                        );
-                        let raw_request = raw.clone();
-                        let resp_bytes = crate::proxy::repeater_send(&host2, port, tls, raw).await;
-                        let status: u16 = std::str::from_utf8(&resp_bytes)
-                            .unwrap_or("")
-                            .lines().next()
-                            .and_then(|l| l.split_whitespace().nth(1))
-                            .and_then(|s| s.parse().ok())
-                            .unwrap_or(0);
-
-                        let evidence = {
-                            let ev = crate::rapport::check_reflected(
-                                &display_cat, payload, &resp_bytes, None);
-                            if crate::rapport::is_false_positive(&display_cat, status) {
-                                None
-                            } else {
-                                ev
-                            }
-                        };
-
-                        let vuln_confirmed = evidence.is_some();
-                        let _ = tx2.send(ScanResult {
-                            ep_idx,
-                            param:    param.clone(),
-                            loc:      loc.clone(),
-                            category: display_cat.clone(),
-                            payload:  payload.clone(),
-                            status,
-                            response:    resp_bytes,
-                            evidence,
-                            raw_request,
-                        }).await;
-
-                        if vuln_confirmed {
-                            let remaining = total_ep_payloads - processed;
-                            if remaining > 0 {
-                                eprintln!("[rustman] [{ep_idx}] vuln confirmed — skipping {remaining} remaining payloads");
-                            }
-                            break 'ep_loop;
-                        }
+            crate::openapi::scan_one_endpoint(
+                &ep,
+                ep_idx,
+                &host2,
+                port,
+                tls,
+                &creds2,
+                payloads2.as_ref(),
+                &stop2,
+                |ev| match ev {
+                    crate::openapi::ScanEvent::Result(r) => {
+                        let _ = tx2.send(r);
                     }
-                }
-            }
+                    crate::openapi::ScanEvent::Skipped(n) => {
+                        eprintln!(
+                            "[rustman] [{ep_idx}] vuln confirmed — skipping {n} remaining payloads"
+                        );
+                    }
+                },
+            )
+            .await;
         }));
     }
 
@@ -326,19 +511,19 @@ pub async fn run(args: CliArgs) -> i32 {
 
     let vuln_count = results.iter().filter(|r| r.evidence.is_some()).count();
     eprintln!(
-        "[rustman] scan complete — {} requests, {} vulnerabilities",
+        "[rustman] scan complete — {} requests, {} injection vulns",
         results.len(),
         vuln_count
     );
 
     // ── Generate report ────────────────────────────────────────────────────────
-    let report = match args.format {
+    let report = match &args.format {
         OutputFormat::Markdown => build_markdown(&target, &endpoints, &results),
         OutputFormat::Json => build_json(&target, &endpoints, &results),
     };
 
-    match args.output {
-        Some(ref path) => {
+    match &args.output {
+        Some(path) => {
             if let Err(e) = std::fs::write(path, &report) {
                 eprintln!("error: cannot write report to {path}: {e}");
                 return 3;
@@ -420,6 +605,13 @@ Toujours utiliser des requêtes préparées (prepared statements) avec des param
 - Appliquer le principe de moindre privilège sur le compte de base de données.\n\
 - Activer le mode strict de l'ORM si applicable.\n\
 - Ne jamais exposer les messages d'erreur SQL à l'utilisateur final.",
+
+        "NoSQLi" => "\
+Ne jamais construire une requête NoSQL à partir d'entrées utilisateur non validées.\n\
+- Forcer le typage des entrées : rejeter les objets/opérateurs (`$ne`, `$gt`, `$where`, `$regex`) là où une chaîne est attendue.\n\
+- Utiliser un ODM avec schéma strict (Mongoose `strict`/`sanitizeFilter`, ou `express-mongo-sanitize`).\n\
+- Désactiver l'exécution de JavaScript côté serveur (`$where`, `mapReduce`) via `--noscripting`.\n\
+- Ne jamais exposer les messages d'erreur du driver à l'utilisateur final.",
 
         "PathTraversal" => "\
 Valider et normaliser tout chemin de fichier avant utilisation.\n\
@@ -610,7 +802,7 @@ fn build_markdown(target: &str, endpoints: &[ApiEndpoint], results: &[ScanResult
 fn category_severity(cat: &str) -> &'static str {
     match cat {
         "CMDi" | "RCE" => "Critical",
-        "SQLi" | "PathTraversal" => "High",
+        "SQLi" | "NoSQLi" | "PathTraversal" => "High",
         "SSRF" | "SSTI" | "XXE" => "High",
         "XSS" => "Medium",
         "OpenRedirect" => "Low",

@@ -5,7 +5,7 @@ pub fn is_false_positive(category: &str, status_code: u16) -> bool {
     status_code == 302
         && matches!(
             category,
-            "XSS" | "SQLi" | "CMDi" | "RCE" | "PathTraversal" | "SSTI"
+            "XSS" | "SQLi" | "NoSQLi" | "CMDi" | "RCE" | "PathTraversal" | "SSTI"
         )
 }
 
@@ -340,6 +340,54 @@ pub fn check_reflected(
             None
         }
 
+        // ── NoSQLi ───────────────────────────────────────────────────────────
+        // Injection NoSQL (MongoDB / Mongoose / CouchDB). Confirmée uniquement
+        // par des messages d'erreur spécifiques au driver, qui n'apparaissent
+        // que lorsque l'opérateur / la syntaxe injecté est réellement interprété
+        // par la base. Ces chaînes sont très spécifiques et ne peuvent pas
+        // provenir d'un simple reflet du payload.
+        "NoSQLi" => {
+            // Une erreur SQL classique signifie que l'entrée atteint un moteur
+            // SQL et non NoSQL → ce serait un faux positif pour cette catégorie.
+            if body_has_sql_error {
+                return None;
+            }
+            const NOSQL_ERRORS: &[&str] = &[
+                // MongoDB / driver Node
+                "mongoservererror",
+                "mongonetworkerror",
+                "mongoparseerror",
+                "mongoerror",
+                "mongo error",
+                "e11000 duplicate key",
+                "unknown top level operator",
+                "unknown operator:",
+                "can't canonicalize query",
+                "bsonerror",
+                "bson error",
+                "$where is not allowed",
+                "$where must be",
+                // Mongoose (ODM)
+                "cast to objectid failed",
+                "cast to number failed",
+                "casterror",
+                "strictmodeerror",
+                "objectparametererror",
+                // CouchDB / autres
+                "query_parse_error",
+                "no_usable_index",
+                "unexpected end of json input while parsing",
+            ];
+            for m in NOSQL_ERRORS {
+                // Garde de réflexion + baseline : le marqueur ne doit pas provenir
+                // du payload renvoyé tel quel, ni préexister dans la réponse.
+                if body_lc.contains(m) && !payload_lc.contains(m) && !baseline_has(baseline, m) {
+                    return Some(evidence_at(body, &body_lc, m));
+                }
+            }
+            None
+        }
+
         // ── CMDi ─────────────────────────────────────────────────────────────
         // Detect actual command output: `id`, `whoami`, `cat /etc/passwd`,
         // `ls -la`, `uname -a`, `ping`, `echo`.
@@ -443,8 +491,11 @@ pub fn check_reflected(
             }
 
             // ── curl / wget exfil confirmed ──
+            // Garde de réflexion : ne pas confirmer si le marqueur provient du
+            // payload lui-même renvoyé tel quel (ex: `; cat /etc/passwd` réfléchi
+            // dans une page HTML n'est PAS une exécution de commande).
             for m in &["/bin/bash", "/bin/sh", "/etc/passwd"] {
-                if in_text_content(body, m) {
+                if in_text_content(body, m) && !payload_lc.contains(m) {
                     return Some(snippet(body, m));
                 }
             }
@@ -535,7 +586,10 @@ pub fn check_reflected(
                 "c:\\windows\\",
                 "c:\\boot.ini",
             ] {
-                if body_lc.contains(m) {
+                // Garde de réflexion + baseline : un payload de traversée qui
+                // contient déjà `windows\system32` ne doit pas se confirmer par
+                // simple réflexion, ni si le marqueur préexiste dans la réponse.
+                if body_lc.contains(m) && !payload_lc.contains(m) && !baseline_has(baseline, m) {
                     return Some(evidence_at(body, &body_lc, m));
                 }
             }
@@ -558,35 +612,29 @@ pub fn check_reflected(
             if body_has_sql_error {
                 return None;
             }
-            // ── 7777*7777 = 60493729 (all engines except Jinja2 string-repeat) ──
+            // ── 7777*7777 = 60481729 (all engines except Jinja2 string-repeat) ──
             if payload.contains("7777*7777") {
                 if body.contains(payload) {
                     return None;
                 } // raw echo → not evaluated
-                if body_lc.contains("60493729") {
-                    return Some(evidence_at(body, &body_lc, "60493729"));
+                if body_lc.contains("60481729") {
+                    return Some(evidence_at(body, &body_lc, "60481729"));
                 }
                 return None;
             }
 
-            // ── {{7*'7'}} → Jinja2 returns "7777777", Twig returns "49" ──
-            if payload_lc.contains("7*'7'") {
-                if body.contains("7777777") {
-                    return Some(snippet(body, "7777777"));
-                }
-                // Twig / PHP string multiply → 49
-                if body.contains("49")
-                    && !body.contains(payload)
-                    && !baseline_has(baseline, "49")
-                    && whole_word(body, "49")
-                {
-                    return Some(snippet(body, "49"));
-                }
+            // ── {{7*'7'}} → Jinja2 renvoie "7777777" (spécifique, fiable) ──
+            // NB : on NE teste PAS le "49" de Twig/PHP : le nombre 49 est bien
+            // trop courant (valeurs CSS, coordonnées, IDs…) et provoque des faux
+            // positifs sur toute grande page HTML. La sonde arithmétique
+            // `7777*7777=60481729` (8 chiffres) couvre la détection sans ce risque.
+            if payload_lc.contains("7*'7'") && body.contains("7777777") {
+                return Some(snippet(body, "7777777"));
             }
 
             // ── Combined probe: {{7*'7'}}abc{{7777*7777}} ──
             if payload_lc.contains("7*'7'") && payload_lc.contains("7777*7777") {
-                for m in &["60493729", "7777777"] {
+                for m in &["60481729", "7777777"] {
                     if body.contains(m) {
                         return Some(snippet(body, m));
                     }
@@ -598,15 +646,15 @@ pub fn check_reflected(
                 || payload_lc.starts_with("#{")
                 || payload_lc.starts_with("*{")
             {
-                if body_lc.contains("60493729") {
-                    return Some(evidence_at(body, &body_lc, "60493729"));
+                if body_lc.contains("60481729") {
+                    return Some(evidence_at(body, &body_lc, "60481729"));
                 }
             }
 
             // ── ERB / Slim: <%= 7777*7777 %> ──
             if payload_lc.contains("<%=") {
-                if body_lc.contains("60493729") {
-                    return Some(evidence_at(body, &body_lc, "60493729"));
+                if body_lc.contains("60481729") {
+                    return Some(evidence_at(body, &body_lc, "60481729"));
                 }
             }
 
@@ -671,7 +719,10 @@ pub fn check_reflected(
                 "mustache",
                 "template rendering error",
             ] {
-                if body_lc.contains(m) && !baseline_has(baseline, m) {
+                // Garde de réflexion : le nom du moteur ne doit pas provenir du
+                // payload renvoyé tel quel (ex: un payload Freemarker réfléchi
+                // dans une réponse JSON contient « freemarker » sans exécution).
+                if body_lc.contains(m) && !payload_lc.contains(m) && !baseline_has(baseline, m) {
                     return Some(evidence_at(body, &body_lc, m));
                 }
             }

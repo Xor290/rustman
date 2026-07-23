@@ -36,6 +36,7 @@ pub enum ScanMsg {
 pub fn payload_cat_name(stem: &str) -> &'static str {
     match stem {
         "sqli" => "SQLi",
+        "nosql" => "NoSQLi",
         "xss" => "XSS",
         "cmdi" => "CMDi",
         "rce" => "RCE",
@@ -231,6 +232,255 @@ impl ApiEndpoint {
             format!(
                 "{method} {full_path} HTTP/1.1\r\nHost: {host_hdr}\r\nContent-Type: application/json\r\nContent-Length: {body_len}\r\nAccept: application/json\r\n{cookie_line}{auth_line}{api_key_line}Connection: close\r\n\r\n{body}"
             ).into_bytes()
+        }
+    }
+}
+
+/// Nom de paramètre sentinelle pour construire une requête « propre » (baseline).
+/// Il ne correspond à aucun paramètre réel : `build_request_fuzzed` n'injecte donc
+/// aucun payload et tous les champs reçoivent leur valeur bénigne par défaut.
+const BASELINE_SENTINEL: &str = "__rustman_baseline__";
+
+/// Valeur bénigne de contrôle réinjectée lors de la passe de confirmation.
+/// Purement alphanumérique : ne contient ni métacaractère HTML/SQL/shell, ni URL,
+/// donc ne peut légitimement déclencher aucun détecteur côté serveur.
+const CONTROL_VALUE: &str = "rustmanctl7391";
+
+impl ApiEndpoint {
+    /// Construit une requête baseline : aucune injection, tous les paramètres
+    /// reçoivent leur valeur bénigne. Sert de référence pour distinguer un
+    /// marqueur causé par le payload d'un marqueur déjà présent dans la réponse
+    /// normale de l'endpoint (cf. `check_reflected` / `baseline_has`).
+    pub fn build_request_baseline(
+        &self,
+        host: &str,
+        port: u16,
+        tls: bool,
+        cookie_hdr: &str,
+        bearer: &str,
+        api_key_header: &str,
+        api_key_value: &str,
+    ) -> Vec<u8> {
+        self.build_request_fuzzed(
+            host,
+            port,
+            tls,
+            cookie_hdr,
+            bearer,
+            api_key_header,
+            api_key_value,
+            BASELINE_SENTINEL,
+            &ParamLoc::Path,
+            "",
+        )
+    }
+}
+
+/// Passe de confirmation anti-faux-positif appliquée à toute détection avant de
+/// la valider. Renvoie `true` uniquement si la vulnérabilité est confirmée.
+///
+/// 1. **Rejeu du même payload** — l'evidence doit réapparaître. Élimine les
+///    réponses transitoires / non-déterministes (rate-limit, WAF, contenu
+///    dynamique, aléa serveur).
+/// 2. **Contrôle bénin** — on rejoue le *même paramètre* avec une valeur bénigne
+///    (`CONTROL_VALUE`) ; l'evidence doit être **absente**. Élimine les marqueurs
+///    indépendants de l'injection (l'endpoint renvoie le marqueur quel que soit
+///    l'input). Non appliqué à XSS : le détecteur XSS considère toute réflexion
+///    comme exploitable, donc un contrôle réfléchi le déclencherait à tort et
+///    invaliderait un vrai XSS. Idem pour OpenRedirect (le payload est réfléchi
+///    dans l'en-tête `Location`). Pour ces deux catégories, l'étape 1 suffit ;
+///    leurs détecteurs exigent déjà que le payload lui-même apparaisse dans la
+///    réponse, ce qui écarte les redirections/réflexions fixes non contrôlées.
+#[allow(clippy::too_many_arguments)]
+pub async fn confirm_detection(
+    ep: &ApiEndpoint,
+    host: &str,
+    port: u16,
+    tls: bool,
+    creds: &Credentials,
+    param: &str,
+    loc: &ParamLoc,
+    payload: &str,
+    category: &str,
+    baseline: Option<&[u8]>,
+) -> bool {
+    let cookie = creds.cookie.as_deref().unwrap_or("");
+    let bearer = creds.bearer.as_deref().unwrap_or("");
+    let akh = creds.api_key_header.as_deref().unwrap_or("");
+    let akv = creds.api_key_value.as_deref().unwrap_or("");
+
+    // 1. Rejeu du même payload : l'evidence doit réapparaître.
+    let raw = ep.build_request_fuzzed(
+        host, port, tls, cookie, bearer, akh, akv, param, loc, payload,
+    );
+    let resp = crate::proxy::repeater_send(host, port, tls, raw).await;
+    if crate::rapport::check_reflected(category, payload, &resp, baseline).is_none() {
+        return false; // réponse transitoire → non confirmé
+    }
+
+    // 2. Contrôle bénin : l'evidence doit être absente (hors catégories
+    //    réflexives XSS / OpenRedirect).
+    if category != "XSS" && category != "OpenRedirect" {
+        let raw_ctl = ep.build_request_fuzzed(
+            host, port, tls, cookie, bearer, akh, akv, param, loc, CONTROL_VALUE,
+        );
+        let resp_ctl = crate::proxy::repeater_send(host, port, tls, raw_ctl).await;
+        if crate::rapport::check_reflected(category, CONTROL_VALUE, &resp_ctl, baseline).is_some() {
+            return false; // marqueur indépendant de l'injection → faux positif
+        }
+    }
+
+    true
+}
+
+/// Événement émis pendant le scan d'un endpoint.
+pub enum ScanEvent {
+    /// Résultat d'un test de payload (vuln confirmée si `evidence.is_some()`).
+    Result(ScanResult),
+    /// `n` payloads restants ont été sautés après une confirmation (early-stop).
+    Skipped(usize),
+}
+
+/// Scanne un endpoint de bout en bout : baseline, fuzzing de chaque paramètre ×
+/// payload, détection puis passe de confirmation anti-faux-positif. Chaque
+/// résultat est transmis via `emit`.
+///
+/// C'est la logique partagée par toutes les sources d'endpoints (scanner OpenAPI
+/// CLI + GUI, et scanner issu du crawler) : le durcissement anti-FP (baseline +
+/// [`confirm_detection`] + gardes de réflexion dans `check_reflected`) s'applique
+/// donc à l'identique quelle que soit la provenance de l'endpoint.
+#[allow(clippy::too_many_arguments)]
+pub async fn scan_one_endpoint<F>(
+    ep: &ApiEndpoint,
+    ep_idx: usize,
+    host: &str,
+    port: u16,
+    tls: bool,
+    creds: &Credentials,
+    payloads: &[(String, Vec<String>)],
+    stop: &std::sync::atomic::AtomicBool,
+    mut emit: F,
+) where
+    F: FnMut(ScanEvent),
+{
+    use std::sync::atomic::Ordering;
+
+    let cookie = creds.cookie.as_deref().unwrap_or("");
+    let bearer = creds.bearer.as_deref().unwrap_or("");
+    let akh = creds.api_key_header.as_deref().unwrap_or("");
+    let akv = creds.api_key_value.as_deref().unwrap_or("");
+
+    let mut params: Vec<(String, ParamLoc)> = ep
+        .body_fields
+        .iter()
+        .map(|f| (f.clone(), ParamLoc::Body))
+        .chain(ep.query_params.iter().map(|q| (q.clone(), ParamLoc::Query)))
+        .chain(ep.path_params.iter().map(|p| (p.clone(), ParamLoc::Path)))
+        .collect();
+    // Endpoint sans paramètre détecté : on injecte via un paramètre générique
+    // pour ne jamais laisser un endpoint non testé.
+    if params.is_empty() {
+        let fallback = if matches!(ep.method.to_uppercase().as_str(), "POST" | "PUT" | "PATCH") {
+            ("data".to_string(), ParamLoc::Body)
+        } else {
+            ("id".to_string(), ParamLoc::Query)
+        };
+        params.push(fallback);
+    }
+
+    let total_ep_payloads: usize =
+        params.len() * payloads.iter().map(|(_, p)| p.len()).sum::<usize>();
+    let mut processed = 0usize;
+
+    // Baseline : une requête « propre » par endpoint. Référence pour filtrer
+    // tout marqueur déjà présent dans la réponse normale.
+    let baseline: Vec<u8> = {
+        let raw = ep.build_request_baseline(host, port, tls, cookie, bearer, akh, akv);
+        crate::proxy::repeater_send(host, port, tls, raw).await
+    };
+
+    'ep_loop: for (param, loc) in &params {
+        for (cat, plist) in payloads {
+            if stop.load(Ordering::Relaxed) {
+                break 'ep_loop;
+            }
+            let display_cat = payload_cat_name(cat).to_string();
+
+            for payload in plist {
+                if stop.load(Ordering::Relaxed) {
+                    break 'ep_loop;
+                }
+                processed += 1;
+
+                let raw = ep.build_request_fuzzed(
+                    host, port, tls, cookie, bearer, akh, akv, param, loc, payload,
+                );
+                let raw_request = raw.clone();
+                let resp_bytes = crate::proxy::repeater_send(host, port, tls, raw).await;
+                let status: u16 = std::str::from_utf8(&resp_bytes)
+                    .unwrap_or("")
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+
+                let evidence = {
+                    let ev = crate::rapport::check_reflected(
+                        &display_cat,
+                        payload,
+                        &resp_bytes,
+                        Some(&baseline),
+                    );
+                    if crate::rapport::is_false_positive(&display_cat, status) {
+                        None
+                    } else {
+                        ev
+                    }
+                };
+
+                // Passe de confirmation : rejeu + contrôle bénin (~0 faux positif).
+                let evidence = if evidence.is_some()
+                    && confirm_detection(
+                        ep,
+                        host,
+                        port,
+                        tls,
+                        creds,
+                        param,
+                        loc,
+                        payload,
+                        &display_cat,
+                        Some(&baseline),
+                    )
+                    .await
+                {
+                    evidence
+                } else {
+                    None
+                };
+
+                let vuln_confirmed = evidence.is_some();
+                emit(ScanEvent::Result(ScanResult {
+                    ep_idx,
+                    param: param.clone(),
+                    loc: loc.clone(),
+                    category: display_cat.clone(),
+                    payload: payload.clone(),
+                    status,
+                    response: resp_bytes,
+                    evidence,
+                    raw_request,
+                }));
+
+                if vuln_confirmed {
+                    let remaining = total_ep_payloads - processed;
+                    if remaining > 0 {
+                        emit(ScanEvent::Skipped(remaining));
+                    }
+                    break 'ep_loop;
+                }
+            }
         }
     }
 }
@@ -544,4 +794,48 @@ fn is_http_method(s: &str) -> bool {
         s.to_ascii_lowercase().as_str(),
         "get" | "post" | "put" | "delete" | "patch" | "head" | "options"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// La requête baseline ne doit contenir aucune valeur d'injection : les
+    /// paramètres de chemin valent `1`, les query params `test`, aucun paramètre
+    /// parasite (`?=…`) et surtout jamais la sentinelle ni un payload.
+    #[test]
+    fn baseline_request_is_clean() {
+        let ep = ApiEndpoint {
+            method: "GET".into(),
+            path: "/users/{id}".into(),
+            query_params: vec!["q".into()],
+            body_fields: vec![],
+            path_params: vec!["id".into()],
+        };
+        let raw = ep.build_request_baseline("example.com", 443, true, "", "", "", "");
+        let s = String::from_utf8(raw).unwrap();
+        let request_line = s.lines().next().unwrap();
+        assert!(request_line.starts_with("GET /users/1?q=test "), "got: {request_line}");
+        assert!(!s.contains(BASELINE_SENTINEL), "sentinel leaked into request");
+        // Pas de paramètre à nom vide injecté par le fallback query.
+        assert!(!request_line.contains("?=") && !request_line.contains("&="));
+    }
+
+    /// Baseline pour un POST : le body contient les champs avec des valeurs
+    /// bénignes, jamais un payload.
+    #[test]
+    fn baseline_post_body_is_benign() {
+        let ep = ApiEndpoint {
+            method: "POST".into(),
+            path: "/login".into(),
+            query_params: vec![],
+            body_fields: vec!["username".into(), "password".into()],
+            path_params: vec![],
+        };
+        let raw = ep.build_request_baseline("example.com", 443, true, "", "", "", "");
+        let s = String::from_utf8(raw).unwrap();
+        assert!(s.contains(r#""username":"test""#), "got: {s}");
+        assert!(s.contains(r#""password":"test""#), "got: {s}");
+        assert!(!s.contains(BASELINE_SENTINEL));
+    }
 }

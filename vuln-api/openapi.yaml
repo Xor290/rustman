@@ -1,0 +1,142 @@
+openapi: 3.0.3
+info:
+  title: vuln-api
+  version: 1.0.0
+  description: >
+    API délibérément vulnérable pour tester le scanner OpenAPI de rustman.
+    Usage strictement local / labo. Ne pas exposer.
+
+servers:
+  - url: http://127.0.0.1:8000
+
+# Aucune authentification requise sur cette cible de test. Le bloc ci-dessous
+# montre le format `x-credentials` supporté par rustman (décommenter au besoin).
+# x-credentials:
+#   bearer: "eyJhbGciOi..."
+#   cookie: "session=abc123"
+#   api_key_header: "X-API-Key"
+#   api_key_value: "secret"
+
+paths:
+  # ── Endpoints vulnérables (vrais positifs attendus) ────────────────────────
+  /api/users:
+    get:
+      summary: Recherche d'utilisateur par id (SQLi)
+      parameters:
+        - name: id
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: OK }
+
+  /api/account:
+    get:
+      summary: Recherche de compte (NoSQL injection - MongoDB)
+      parameters:
+        - name: filter
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: OK }
+
+  /api/search:
+    get:
+      summary: Recherche (XSS réfléchi)
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: OK }
+
+  /api/ping:
+    get:
+      summary: Ping d'un hôte (injection de commande)
+      parameters:
+        - name: host
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: OK }
+
+  /api/file:
+    get:
+      summary: Lecture de fichier (path traversal)
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: OK }
+
+  /api/render:
+    get:
+      summary: Rendu de template (SSTI)
+      parameters:
+        - name: tpl
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: OK }
+
+  /api/fetch:
+    get:
+      summary: Récupération d'URL côté serveur (SSRF)
+      parameters:
+        - name: url
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: OK }
+
+  /api/redirect:
+    get:
+      summary: Redirection (open redirect)
+      parameters:
+        - name: url
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "302": { description: Redirect }
+
+  # ── Pièges à faux positifs (aucune vuln ne doit être remontée) ─────────────
+  /api/health:
+    get:
+      summary: "Diagnostic — marqueurs constants (piège FP)"
+      parameters:
+        - name: verbose
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        "200": { description: OK }
+
+  /api/monitor:
+    get:
+      summary: "Monitoring — 'connection refused' constant (piège FP)"
+      parameters:
+        - name: target
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        "200": { description: OK }
+
+  /api/echo:
+    get:
+      summary: "Echo JSON — réflexion non exploitable (piège FP XSS)"
+      parameters:
+        - name: msg
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        "200": { description: OK }
