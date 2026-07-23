@@ -579,6 +579,26 @@ impl RustmanApp {
         false
     }
 
+    fn poll_exec(&mut self) -> bool {
+        let Some(rx) = &self.exploit_exec_rx else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(out) => {
+                self.exploit_exec_rx = None;
+                self.exploit_exec_running = false;
+                self.exploit_exec_output = Some(out);
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(_) => {
+                self.exploit_exec_rx = None;
+                self.exploit_exec_running = false;
+                true
+            }
+        }
+    }
+
     fn send_selected_to_repeater(&mut self) {
         let idx = match self.selected {
             Some(i) => i,
@@ -614,7 +634,10 @@ impl RustmanApp {
 impl eframe::App for RustmanApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Adaptive repaint: fast when something is in-flight (spinner), slow when idle.
-        let has_inflight = self.crawler_running || self.exploit_thinking || self.openapi_scanning;
+        let has_inflight = self.crawler_running
+            || self.exploit_thinking
+            || self.openapi_scanning
+            || self.exploit_exec_running;
         ctx.request_repaint_after(std::time::Duration::from_millis(if has_inflight {
             80
         } else {
@@ -642,6 +665,7 @@ impl eframe::App for RustmanApp {
             | self.poll_crawler(ctx)
             | self.poll_exploit_http()
             | self.poll_exploit()
+            | self.poll_exec()
             | self.poll_openapi();
         if repaint {
             ctx.request_repaint();
@@ -2114,7 +2138,85 @@ impl RustmanApp {
                         ui.selectable_value(&mut self.exploit_exec_lang, ExecLang::Python, "Python");
                     });
 
-                let avail_h = ui.available_height();
+                let show_output = self.exploit_exec_running || self.exploit_exec_output.is_some();
+                let output_h: f32 = if show_output { 200.0 } else { 0.0 };
+
+                if show_output {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.colored_label(
+                            Color32::from_rgb(255, 160, 60),
+                            RichText::new("OUTPUT").size(10.0),
+                        );
+                        if self.exploit_exec_running {
+                            ui.add_space(6.0);
+                            ui.spinner();
+                            ui.colored_label(Color32::GRAY, "running…");
+                        } else if let Some(out) = &self.exploit_exec_output {
+                            ui.add_space(6.0);
+                            let (txt, col) = if out.timed_out {
+                                ("timeout (30s)".to_string(), Color32::from_rgb(220, 80, 80))
+                            } else {
+                                match out.code {
+                                    Some(0) => ("exit 0".to_string(), Color32::from_rgb(120, 200, 120)),
+                                    Some(c) => (format!("exit {c}"), Color32::from_rgb(220, 160, 80)),
+                                    None => ("no exit code".to_string(), Color32::from_rgb(220, 80, 80)),
+                                }
+                            };
+                            ui.colored_label(col, RichText::new(txt).monospace().size(10.0));
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Clear").clicked() {
+                                self.exploit_exec_output = None;
+                            }
+                        });
+                    });
+                    egui::Frame::none()
+                        .fill(Color32::from_rgb(16, 16, 20))
+                        .rounding(4.0)
+                        .inner_margin(egui::Margin::same(6.0))
+                        .show(ui, |ui| {
+                            ui.set_max_height(output_h.max(0.0));
+                            ScrollArea::vertical()
+                                .id_salt("exploit_exec_output_scroll")
+                                .max_height((output_h - 12.0).max(0.0))
+                                .show(ui, |ui| {
+                                    if let Some(out) = &self.exploit_exec_output {
+                                        if !out.stdout.is_empty() {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(&out.stdout)
+                                                        .monospace()
+                                                        .size(11.0)
+                                                        .color(Color32::from_rgb(180, 230, 180)),
+                                                )
+                                                .selectable(true),
+                                            );
+                                        }
+                                        if !out.stderr.is_empty() {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(&out.stderr)
+                                                        .monospace()
+                                                        .size(11.0)
+                                                        .color(Color32::from_rgb(230, 140, 140)),
+                                                )
+                                                .selectable(true),
+                                            );
+                                        }
+                                        if out.stdout.is_empty() && out.stderr.is_empty() {
+                                            ui.colored_label(
+                                                Color32::DARK_GRAY,
+                                                "(no output)",
+                                            );
+                                        }
+                                    }
+                                });
+                        });
+                    ui.add_space(4.0);
+                }
+
+                let avail_h = ui.available_height().max(0.0);
                 ScrollArea::vertical()
                     .id_salt("exploit_code_scroll")
                     .max_height(avail_h)
